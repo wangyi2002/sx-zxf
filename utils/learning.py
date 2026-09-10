@@ -1,4 +1,5 @@
 from model.MotionAGFormer import MotionAGFormer
+from model.MotionAGFormer_MoE import MotionAGFormerMoE
 from torch import nn
 import torch
 
@@ -31,31 +32,44 @@ def load_model(args):
         'relu': nn.ReLU
     }
 
+    common_kwargs = dict(
+        n_layers=args.n_layers,
+        dim_in=args.dim_in,
+        dim_feat=args.dim_feat,
+        dim_rep=args.dim_rep,
+        dim_out=args.dim_out,
+        mlp_ratio=args.mlp_ratio,
+        act_layer=act_mapper[args.act_layer],
+        attn_drop=args.attn_drop,
+        drop=args.drop,
+        drop_path=args.drop_path,
+        use_layer_scale=args.use_layer_scale,
+        layer_scale_init_value=args.layer_scale_init_value,
+        num_heads=args.num_heads,
+        qkv_bias=args.qkv_bias,
+        qkv_scale=args.qkv_scale,
+        num_joints=args.num_joints,
+        use_temporal_similarity=args.use_temporal_similarity,
+        temporal_connection_len=args.temporal_connection_len,
+        neighbour_num=args.neighbour_num,
+        n_frames=args.n_frames,
+    )
+
     if args.model_name == "MotionAGFormer":
-        model = MotionAGFormer(n_layers=args.n_layers,
-                               dim_in=args.dim_in,
-                               dim_feat=args.dim_feat,
-                               dim_rep=args.dim_rep,
-                               dim_out=args.dim_out,
-                               mlp_ratio=args.mlp_ratio,
-                               act_layer=act_mapper[args.act_layer],
-                               attn_drop=args.attn_drop,
-                               drop=args.drop,
-                               drop_path=args.drop_path,
-                               use_layer_scale=args.use_layer_scale,
-                               layer_scale_init_value=args.layer_scale_init_value,
-                               use_adaptive_fusion=args.use_adaptive_fusion,
-                               num_heads=args.num_heads,
-                               qkv_bias=args.qkv_bias,
-                               qkv_scale=args.qkv_scale,
-                               hierarchical=args.hierarchical,
-                               num_joints=args.num_joints,
-                               use_temporal_similarity=args.use_temporal_similarity,
-                               temporal_connection_len=args.temporal_connection_len,
-                               use_tcn=args.use_tcn,
-                               graph_only=args.graph_only,
-                               neighbour_num=args.neighbour_num,
-                               n_frames=args.n_frames)
+        model = MotionAGFormer(
+            **common_kwargs,
+            use_adaptive_fusion=args.use_adaptive_fusion,
+            hierarchical=args.hierarchical,
+            use_tcn=args.use_tcn,
+            graph_only=args.graph_only,
+        )
+    elif args.model_name == "MotionAGFormerMoE":
+        model = MotionAGFormerMoE(
+            **common_kwargs,
+            router_hidden_ratio=getattr(args, 'router_hidden_ratio', 0.5),
+            rwkv_head_size=getattr(args, 'rwkv_head_size', 32),
+            rwkv_ffn_mult=getattr(args, 'rwkv_ffn_mult', 3.5),
+        )
     else:
         raise Exception("Undefined model name")
 
@@ -79,8 +93,6 @@ def load_pretrained_weights(model, checkpoint):
     new_state_dict = collections.OrderedDict()
     matched_layers, discarded_layers = [], []
     for k, v in state_dict.items():
-        # If the pretrained state_dict was saved as nn.DataParallel,
-        # keys would contain "module.", which should be ignored.
         if k.startswith('module.'):
             k = k[7:]
         if k in model_dict:
@@ -95,7 +107,6 @@ def load_pretrained_weights(model, checkpoint):
 
 
 def accuracy(output, target, topk=(1,)):
-    """Computes the accuracy over the k top predictions for the specified values of k"""
     with torch.no_grad():
         maxk = max(topk)
         batch_size = target.size(0)
