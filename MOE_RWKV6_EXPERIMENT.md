@@ -2,384 +2,267 @@
 
 ## 1. Goal
 
-This branch explores a first-stage temporal Mixture-of-Experts design on top of the existing `sx-zxf` MotionAGFormer baseline.
+This branch explores a parameter-efficient temporal Mixture-of-Experts design on top of the existing `sx-zxf` MotionAGFormer baseline.
 
-The current hypothesis is:
+Core hypothesis:
 
-> Different joints and different motion states may benefit from different temporal modeling biases. Therefore, instead of using one fixed temporal operator in every block, use Mamba and RWKV-6 as parallel temporal experts and learn data-dependent fusion weights with a router.
+> Different temporal modeling biases can be complementary for 3D human pose estimation. Mamba remains the main temporal expert, while a lightweight RWKV-6 TimeMix branch acts as an auxiliary temporal expert whose contribution is selected by a learned router.
 
-The first implementation intentionally keeps the design simple so that the effect of expert fusion can be evaluated independently.
+The current version intentionally keeps the parameter count close to the baseline instead of placing two full experts in all 30 blocks.
 
 ---
 
 ## 2. Branch
 
-Experiment branch:
-
 ```text
 moe-rwkv6
 ```
 
-The original `main` branch is not modified by this experiment.
+The original `main` branch remains unchanged.
 
 ---
 
-## 3. Main architectural change
+## 3. Current architecture
 
-The original block is conceptually:
+The original 30-layer Mamba / Attention schedule is retained.
 
-```text
-Spatial Module
-    ↓
-Temporal Module
-    ↓
-Next Block
-```
+### Original Attention blocks
 
-The MoE version is:
+These are kept unchanged:
 
 ```text
-Spatial Module
-    ↓
-Shared Feature X [B,T,J,C]
-    ├────────────→ Mamba Temporal Expert ──┐
-    ├────────────→ RWKV-6 Temporal Expert ─┤
-    └────────────→ Router ──────────────────┘
-                         ↓
-                 Softmax weights
-                  [B,T,J,2]
-                         ↓
-                 Weighted Fusion
-                         ↓
-                    Next Block
+Spatial Attention
+      ↓
+Temporal Attention
+      ↓
+Shared MLP
 ```
 
-The original spatial schedule is retained:
+### Original Mamba blocks
 
-- early blocks: Spatial Mamba
-- middle blocks: Spatial Attention
-- later blocks: Spatial Mamba / Attention according to the original `create_layers` schedule
+Only these blocks are upgraded to temporal MoE:
 
-Only the temporal stage is replaced by a Mamba + RWKV-6 dense expert module.
+```text
+Spatial Mamba
+      ↓
+Shared feature X [B,T,J,128]
+      │
+      ├──────────────→ Mamba Temporal Expert, D=128 ───────────┐
+      │                                                       │
+      ├→ Linear 128→64 → RWKV6 TimeMix, D=64 → Linear 64→128 ┤
+      │                                                       │
+      └──────────────→ Router [B,T,J,2] ──────────────────────┘
+                              ↓
+                         Softmax fusion
+                              ↓
+                          Shared MLP
+```
+
+For the default `n_layers=30` schedule, the original model contains 13 Mamba blocks, so only those 13 blocks use temporal MoE. The remaining Attention blocks are unchanged.
 
 ---
 
-## 4. Router design
+## 4. Why the RWKV expert is lightweight
 
-The initial router is a small MLP:
+The first version used a full RWKV-6 block in every layer, including both TimeMix and ChannelMix. That increased the model from roughly baseline scale to about 19M parameters and also increased activation memory substantially.
+
+The current version makes three reductions:
+
+1. **MoE only in the original Mamba blocks**, rather than all 30 blocks.
+2. **RWKV TimeMix only**; RWKV ChannelMix is removed from the active expert path because the outer block already contains a shared AGFormer MLP.
+3. **RWKV bottleneck dimension = 64**, while the shared backbone stays at 128 dimensions.
+
+The active RWKV path is therefore:
 
 ```text
-C
-↓
-Linear(C, C * router_hidden_ratio)
-↓
+128 → 64 → RWKV6 TimeMix(64) → 128
+```
+
+The full `RWKV6Block` implementation is still kept in `model/modules/rwkv6.py` for future ablations, but the current MoE does not use it.
+
+---
+
+## 5. Router design
+
+The router remains dense and frame-joint adaptive:
+
+```text
+[B,T,J,128]
+      ↓
+Linear(128, 32)
+      ↓
 GELU
-↓
-Linear(..., 2)
-↓
+      ↓
+Linear(32, 2)
+      ↓
 Softmax
 ```
 
-Input:
+With the default configuration:
 
-```text
-[B,T,J,C]
+```yaml
+router_hidden_ratio: 0.25
 ```
 
-Output:
+Router output:
 
 ```text
 [B,T,J,2]
 ```
 
-Therefore every frame and every joint receives two fusion weights:
-
-```text
-w_mamba
-w_rwkv
-```
-
-with:
+and:
 
 ```text
 w_mamba + w_rwkv = 1
 ```
 
-The router is initialized so the first forward pass starts close to:
+The final temporal representation is:
 
 ```text
-Mamba = 0.5
-RWKV  = 0.5
+Y = w_mamba * Y_mamba + w_rwkv * Y_rwkv
 ```
 
-This is a **dense soft routing** design, not sparse Top-K routing.
-
-Both experts always process the complete sequence, so frame-level routing weights do not break temporal continuity inside Mamba or RWKV.
+Both experts still process complete temporal trajectories, so frame-wise routing weights do not break temporal continuity inside either expert.
 
 ---
 
-## 5. Expert fusion
+## 6. RWKV-6 lightweight configuration
 
-For shared feature `X`:
+Default H36M settings:
 
-```text
-Y_mamba = Mamba(X)
-Y_rwkv  = RWKV6(X)
+```yaml
+rwkv_dim: 64
+rwkv_head_size: 32
+rwkv_mix_rank: 16
+rwkv_decay_rank: 32
 ```
 
-Router:
+Thus the RWKV expert has:
 
 ```text
-W = softmax(Router(X))
+shared feature dim = 128
+expert feature dim = 64
+head size          = 32
+number of heads    = 2
+mix low-rank dim   = 16
+decay low-rank dim = 32
 ```
 
-Fusion:
-
-```text
-Y = W[..., 0] * Y_mamba + W[..., 1] * Y_rwkv
-```
-
-Both expert outputs preserve the original shape:
-
-```text
-[B,T,J,C]
-```
+The low-rank dimensions are scaled down together with the expert width to keep the auxiliary expert compact.
 
 ---
 
-## 6. RWKV-6 pose adaptation
-
-The new RWKV module is implemented in:
-
-```text
-model/modules/rwkv6.py
-```
-
-The pose wrapper converts:
-
-```text
-[B,T,J,C]
-```
-
-into independent joint trajectories:
-
-```text
-[B*J,T,C]
-```
-
-RWKV-6 then performs temporal modeling along `T`, after which the output is restored to:
-
-```text
-[B,T,J,C]
-```
-
-This matches the existing temporal Mamba behavior in the repository.
-
-The current RWKV-6 implementation is a **pure PyTorch reference implementation**. It contains:
-
-- token shift / time mixing
-- data-dependent RWKV-6 mixing
-- dynamic decay
-- R/K/V/G projections
-- matrix-valued recurrent state
-- ChannelMix
-- residual block structure
-
-It intentionally does not depend on an external RWKV package or custom CUDA kernel.
-
-Important limitation:
-
-> The WKV recurrence currently uses a Python loop over the temporal dimension. It is suitable for architecture verification and ablation, but it is not appropriate for final speed benchmarking. A CUDA WKV6 kernel can replace the internal recurrent operator later without changing the MoE interface.
-
----
-
-## 7. New files
+## 7. Files changed
 
 ### `model/modules/rwkv6.py`
 
-Implements:
+Adds the active lightweight expert:
 
-- `RWKV6TimeMix`
-- `RWKV6ChannelMix`
-- `RWKV6Block`
-- `RWKV6TemporalExpert`
+```text
+RWKV6TimeMixTemporalExpert
+```
+
+It performs:
+
+```text
+[B,T,J,128]
+→ [B*J,T,128]
+→ 128→64
+→ RWKV6 TimeMix
+→ 64→128
+→ [B,T,J,128]
+```
+
+The full RWKV-6 TimeMix + ChannelMix classes are retained for future comparison.
 
 ### `model/modules/temporal_moe.py`
 
-Implements:
+`TemporalMoE` now contains:
 
-- `TemporalMoE`
-- `TemporalMoEBlock`
-
-`TemporalMoE` contains:
-
-- existing repository Mamba temporal expert
-- RWKV-6 temporal expert
-- frame-joint-level router
-- soft weighted fusion
+- full-width Mamba temporal expert
+- lightweight RWKV6 TimeMix temporal expert
+- frame-joint router
+- dense soft fusion
 
 ### `model/MotionAGFormer_MoE.py`
 
-Defines the new main architecture:
+The original block schedule is preserved:
 
-```text
-MotionAGFormerMoE
-```
+- original Mamba blocks → Spatial Mamba + Temporal MoE
+- original Attention blocks → Spatial Attention + Temporal Attention
 
-The following parts are retained from the baseline design:
+`model.moe_layer_indices` records which layers contain MoE.
 
-- joint embedding
-- spatial GCN stem
-- temporal GCN stem
-- joint positional embedding
-- spatial Mamba / Attention schedule
-- representation head
-- final 3D pose head
+### `model/modules/mamba.py`
 
-The temporal module of each block is replaced by `TemporalMoEBlock`.
+Adds a small CPU reference selective-scan fallback so architecture smoke tests can run on CPU even without `mamba-ssm`.
+
+Important:
+
+> GPU training behavior is unchanged. CUDA inputs still use the original optimized `mamba_ssm` selective scan and will raise an error if `mamba-ssm` is unavailable.
 
 ### `configs/h36m/MotionAGFormer-moe-rwkv6.yaml`
 
-First H36M experiment config.
+Contains the lightweight MoE hyperparameters.
 
 ### `utils/learning.py`
 
-Updated so `load_model` supports:
-
-```yaml
-model_name: MotionAGFormerMoE
-```
+Passes the new lightweight MoE configuration into `MotionAGFormerMoE`.
 
 ---
 
-## 8. Initial configuration
+## 8. CPU verification rule
 
-Current H36M settings inherit the baseline large configuration:
+For this experimental branch, every future model-code modification should be followed by:
 
-```yaml
-n_layers: 30
-dim_feat: 128
-n_frames: 243
-num_joints: 17
-```
+1. CPU model instantiation.
+2. A small-batch forward pass.
+3. Output-shape validation.
+4. Router-shape validation when applicable.
+5. Total parameter count.
+6. Trainable parameter count.
 
-MoE-specific settings:
-
-```yaml
-router_hidden_ratio: 0.5
-rwkv_head_size: 32
-rwkv_ffn_mult: 3.5
-```
-
-For `dim_feat=128` and `rwkv_head_size=32`, RWKV uses 4 heads.
+The CPU selective-scan reference exists specifically to support this smoke-test workflow. It is not intended for speed benchmarking or final training.
 
 ---
 
-## 9. Dependencies
+## 9. Training configuration
 
-No additional third-party RWKV package is required by the new RWKV-6 module.
-
-The new module itself only depends on PyTorch.
-
-However, the repository's existing Mamba implementation already imports:
-
-```python
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
-```
-
-so the runtime environment still needs a compatible `mamba-ssm` installation even though it is not currently listed in `requirements.txt`.
-
----
-
-## 10. Router inspection
-
-`MotionAGFormerMoE.forward` supports:
-
-```python
-output, router_weights = model(x, return_router=True)
-```
-
-Each element in `router_weights` has shape:
+Current H36M config:
 
 ```text
-[B,T,J,2]
+configs/h36m/MotionAGFormer-moe-rwkv6.yaml
 ```
 
-This is intended for later analysis such as:
+Training command:
 
-- joint-specific expert preference
-- action-specific expert preference
-- frame-wise expert switching
-- layer-wise routing heatmaps
-
-Potential visualizations:
-
-```text
-Layer × Joint × Expert
+```bash
+python train.py --config configs/h36m/MotionAGFormer-moe-rwkv6.yaml
 ```
 
-and comparisons such as:
+With WandB:
 
-```text
-walking wrist
-running wrist
-sitting wrist
+```bash
+python train.py \
+  --config configs/h36m/MotionAGFormer-moe-rwkv6.yaml \
+  --use-wandb \
+  --wandb-name moe-rwkv6-light
 ```
 
 ---
 
-## 11. Important experimental caveat
-
-This first implementation puts dense Mamba + RWKV-6 temporal experts in every block.
-
-Therefore compared with the baseline it will increase:
-
-- parameter count
-- FLOPs
-- activation memory
-- optimizer state
-- training time
-
-The first experiment should be treated as an architecture feasibility test, not yet as an efficiency-optimized final design.
-
-If the idea is effective, follow-up ablations should evaluate:
-
-1. MoE only in selected blocks.
-2. Joint-level `[B,J,2]` routing versus frame-joint `[B,T,J,2]` routing.
-3. Fixed `0.5 / 0.5` fusion versus learned router.
-4. Mamba-only versus RWKV-only versus MoE.
-5. Motion-aware routing using temporal differences.
-6. Expert specialization and possible sparse routing.
-
----
-
-## 12. Recommended first ablation sequence
+## 10. Recommended ablations
 
 ```text
-Experiment 0
-Original sx-zxf baseline
-
-Experiment 1
-Mamba temporal only
-
-Experiment 2
-RWKV-6 temporal only
-
-Experiment 3
-Mamba + RWKV-6 fixed 0.5 / 0.5 fusion
-
-Experiment 4
-Mamba + RWKV-6 learned router
+A0  Original sx-zxf baseline
+A1  Current lightweight MoE
+A2  Fixed 0.5 / 0.5 fusion instead of learned router
+A3  RWKV dim 32 / 64 / 96
+A4  MoE in fewer selected Mamba layers
+A5  Joint-level routing [B,J,2] vs frame-joint routing [B,T,J,2]
+A6  Motion-aware router using Δ features
 ```
 
-Only after Experiment 4 shows useful expert complementarity should the design be expanded toward more complex routing.
+The current primary research question is:
 
----
-
-## 13. Current research question
-
-The current branch is designed to answer the following first-order question:
-
-> Can Mamba and RWKV-6 provide complementary temporal representations for 3D human pose estimation, and can a lightweight router learn when to rely more on each expert?
-
-If the answer is positive, the next stage can explore true motion-aware expert specialization rather than simply increasing model capacity.
+> Can a small RWKV-6 temporal adapter provide complementary temporal information to the existing Mamba path while keeping parameters and memory close to the original patent baseline?
