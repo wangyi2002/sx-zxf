@@ -22,7 +22,8 @@ class AGFormerBlock(nn.Module):
     def __init__(self, dim, mlp_ratio=4., act_layer=nn.GELU, attn_drop=0., drop=0., drop_path=0.,
                  num_heads=8, qkv_bias=False, qk_scale=None, use_layer_scale=True, layer_scale_init_value=1e-5,
                  mode='spatial', mixer_type="attention", use_temporal_similarity=True,
-                 temporal_connection_len=1, neighbour_num=4, n_frames=243):
+                 temporal_connection_len=1, neighbour_num=4, n_frames=243,
+                 temporal_msm=False, mamba_dt_bias_mode="legacy_double"):
         super().__init__()
 
         self.norm1 = nn.LayerNorm(dim)
@@ -44,7 +45,9 @@ class AGFormerBlock(nn.Module):
                              d_state=8,
                              d_conv=3,
                              expand=1,
-                             mode=mode
+                             mode=mode,
+                             temporal_msm=temporal_msm,
+                             dt_bias_mode=mamba_dt_bias_mode
                              )
             # self.mixer = Mamba2(
             #                 # This module uses roughly 3 * expand * d_model^2 parameters
@@ -94,7 +97,8 @@ class MotionAGFormerBlock(nn.Module):
     def __init__(self, dim, mod="mamba", mlp_ratio=4., act_layer=nn.GELU, attn_drop=0., drop=0., drop_path=0.,
                  num_heads=8, use_layer_scale=True, qkv_bias=False, qk_scale=None, layer_scale_init_value=1e-5,
                  use_adaptive_fusion=False, hierarchical=False, use_temporal_similarity=True,
-                 temporal_connection_len=1, use_tcn=False, graph_only=False, neighbour_num=4, n_frames=243):
+                 temporal_connection_len=1, use_tcn=False, graph_only=False, neighbour_num=4, n_frames=243,
+                 temporal_msm=False, mamba_dt_bias_mode="legacy_double"):
         super().__init__()
         self.hierarchical = hierarchical
         dim = dim // 2 if hierarchical else dim
@@ -105,13 +109,15 @@ class MotionAGFormerBlock(nn.Module):
                                              mode='spatial', mixer_type="attention",
                                              use_temporal_similarity=use_temporal_similarity,
                                              neighbour_num=neighbour_num,
-                                             n_frames=n_frames)
+                                             n_frames=n_frames, temporal_msm=temporal_msm,
+                                              mamba_dt_bias_mode=mamba_dt_bias_mode)
             self.temporal = AGFormerBlock(dim, mlp_ratio, act_layer, attn_drop, drop, drop_path, num_heads, qkv_bias,
                                               qk_scale, use_layer_scale, layer_scale_init_value,
                                               mode='temporal', mixer_type="attention",
                                               use_temporal_similarity=use_temporal_similarity,
                                               neighbour_num=neighbour_num,
-                                              n_frames=n_frames)
+                                              n_frames=n_frames, temporal_msm=temporal_msm,
+                                              mamba_dt_bias_mode=mamba_dt_bias_mode)
         elif mod == "mamba":
         # ST Mamba branch
             self.spatial = AGFormerBlock(dim, mlp_ratio, act_layer, attn_drop, drop, drop_path, num_heads, qkv_bias,
@@ -119,13 +125,15 @@ class MotionAGFormerBlock(nn.Module):
                                               mode='spatial', mixer_type="mamba",
                                               use_temporal_similarity=use_temporal_similarity,
                                               neighbour_num=neighbour_num,
-                                              n_frames=n_frames)
+                                              n_frames=n_frames, temporal_msm=temporal_msm,
+                                              mamba_dt_bias_mode=mamba_dt_bias_mode)
             self.temporal = AGFormerBlock(dim, mlp_ratio, act_layer, attn_drop, drop, drop_path, num_heads, qkv_bias,
                                                qk_scale, use_layer_scale, layer_scale_init_value,
                                                mode='temporal', mixer_type="mamba",
                                                use_temporal_similarity=use_temporal_similarity,
                                                neighbour_num=neighbour_num,
-                                               n_frames=n_frames)
+                                               n_frames=n_frames, temporal_msm=temporal_msm,
+                                              mamba_dt_bias_mode=mamba_dt_bias_mode)
 
         # ST Graph branch
         # if graph_only:
@@ -208,7 +216,8 @@ class MotionAGFormerBlock(nn.Module):
 def create_layers(dim, n_layers, mlp_ratio=4., act_layer=nn.GELU, attn_drop=0., drop_rate=0., drop_path_rate=0.,
                   num_heads=8, use_layer_scale=True, qkv_bias=False, qkv_scale=None, layer_scale_init_value=1e-5,
                   use_adaptive_fusion=True, hierarchical=False, use_temporal_similarity=True,
-                  temporal_connection_len=1, use_tcn=False, graph_only=False, neighbour_num=4, n_frames=243):
+                  temporal_connection_len=1, use_tcn=False, graph_only=False, neighbour_num=4, n_frames=243,
+                 temporal_msm=False, mamba_dt_bias_mode="legacy_double"):
     """
     generates MotionAGFormer layers
     """
@@ -235,7 +244,8 @@ def create_layers(dim, n_layers, mlp_ratio=4., act_layer=nn.GELU, attn_drop=0., 
                                           use_tcn=use_tcn,
                                           graph_only=graph_only,
                                           neighbour_num=neighbour_num,
-                                          n_frames=n_frames))
+                                          n_frames=n_frames, temporal_msm=temporal_msm,
+                                              mamba_dt_bias_mode=mamba_dt_bias_mode))
         elif (n_layers*1/3)-1 < i < (n_layers*2/3)-1:
             layers.append(MotionAGFormerBlock(dim=dim,
                                               mod="attention",
@@ -256,7 +266,8 @@ def create_layers(dim, n_layers, mlp_ratio=4., act_layer=nn.GELU, attn_drop=0., 
                                               use_tcn=use_tcn,
                                               graph_only=graph_only,
                                               neighbour_num=neighbour_num,
-                                              n_frames=n_frames))
+                                              n_frames=n_frames, temporal_msm=temporal_msm,
+                                              mamba_dt_bias_mode=mamba_dt_bias_mode))
         elif (n_layers*2/3)-1 < i < (n_layers*5/6)-1:
             layers.append(MotionAGFormerBlock(dim=dim,
                                               mod="mamba",
@@ -277,7 +288,8 @@ def create_layers(dim, n_layers, mlp_ratio=4., act_layer=nn.GELU, attn_drop=0., 
                                               use_tcn=use_tcn,
                                               graph_only=graph_only,
                                               neighbour_num=neighbour_num,
-                                              n_frames=n_frames))
+                                              n_frames=n_frames, temporal_msm=temporal_msm,
+                                              mamba_dt_bias_mode=mamba_dt_bias_mode))
         else:
             layers.append(MotionAGFormerBlock(dim=dim,
                                               mod="attention",
@@ -298,7 +310,8 @@ def create_layers(dim, n_layers, mlp_ratio=4., act_layer=nn.GELU, attn_drop=0., 
                                               use_tcn=use_tcn,
                                               graph_only=graph_only,
                                               neighbour_num=neighbour_num,
-                                              n_frames=n_frames))
+                                              n_frames=n_frames, temporal_msm=temporal_msm,
+                                              mamba_dt_bias_mode=mamba_dt_bias_mode))
     layers = nn.Sequential(*layers)
 
     return layers
@@ -313,7 +326,8 @@ class MotionAGFormer(nn.Module):
                  drop=0., drop_path=0., use_layer_scale=True, layer_scale_init_value=1e-5, use_adaptive_fusion=True,
                  num_heads=4, qkv_bias=False, qkv_scale=None, hierarchical=False, num_joints=17,
                  use_temporal_similarity=True, temporal_connection_len=1, use_tcn=False, graph_only=False,
-                 neighbour_num=4, n_frames=243):
+                 neighbour_num=4, n_frames=243,
+                 temporal_msm=False, mamba_dt_bias_mode="legacy_double"):
         """
         :param n_layers: Number of layers.
         :param dim_in: Input dimension.
@@ -379,7 +393,8 @@ class MotionAGFormer(nn.Module):
                                     use_tcn=use_tcn,
                                     graph_only=graph_only,
                                     neighbour_num=neighbour_num,
-                                    n_frames=n_frames)
+                                    n_frames=n_frames, temporal_msm=temporal_msm,
+                                              mamba_dt_bias_mode=mamba_dt_bias_mode)
 
         self.rep_logit = nn.Sequential(OrderedDict([
             ('fc', nn.Linear(dim_feat, dim_rep)),

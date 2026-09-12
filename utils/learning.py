@@ -55,7 +55,9 @@ def load_model(args):
                                use_tcn=args.use_tcn,
                                graph_only=args.graph_only,
                                neighbour_num=args.neighbour_num,
-                               n_frames=args.n_frames)
+                               n_frames=args.n_frames,
+                               temporal_msm=getattr(args, "temporal_msm", False),
+                               mamba_dt_bias_mode=getattr(args, "mamba_dt_bias_mode", "legacy_double"))
     else:
         raise Exception("Undefined model name")
 

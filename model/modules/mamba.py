@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from einops import rearrange, repeat
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+from model.modules.scan_backend import selective_scan_fn
 
 
 class MAM(nn.Module):
@@ -27,6 +27,8 @@ class MAM(nn.Module):
             layer_idx=None,
             device=None,
             dtype=None,
+            temporal_msm=False,
+            dt_bias_mode="legacy_double",
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -35,6 +37,10 @@ class MAM(nn.Module):
         self.d_conv = d_conv
         self.expand = expand
         self.mode = mode
+        if dt_bias_mode not in ("legacy_double", "single"):
+            raise ValueError("dt_bias_mode must be legacy_double or single")
+        self.dt_bias_mode = dt_bias_mode
+        self.temporal_msm = bool(temporal_msm) and mode == "temporal"
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
         self.use_fast_path = use_fast_path
@@ -99,6 +105,17 @@ class MAM(nn.Module):
             **factory_kwargs,
         )
 
+        # SX-MSM-01: causal [previous, current] convolution on the MAM input.
+        # Parameter rather than Conv1d avoids consuming baseline initialization RNG.
+        if self.temporal_msm:
+            self.msm_dt_weight = nn.Parameter(torch.zeros(
+                self.d_inner // 2, self.d_model, 2, **factory_kwargs
+            ))
+
+    def motion_dt_logits(self, u):
+        """[batch, time, C] -> [batch, SSM channels, time]; left zero padding."""
+        return F.conv1d(F.pad(u.transpose(1, 2), (1, 0)), self.msm_dt_weight)
+
     def forward(self, hidden_states):
         B, T, J, C = hidden_states.shape
 
@@ -126,7 +143,13 @@ class MAM(nn.Module):
 
         x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
         dt, B_param, C_param = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        dt = rearrange(self.dt_proj(dt), "(b l) d -> b d l", l=seqlen)
+        # Legacy adds dt_proj.bias here AND inside selective_scan_fn.
+        # Keep that behavior by default so MSM is the only experiment variable.
+        projected_dt = (self.dt_proj(dt) if self.dt_bias_mode == "legacy_double"
+                        else F.linear(dt, self.dt_proj.weight))
+        dt = rearrange(projected_dt, "(b l) d -> b d l", l=seqlen)
+        if self.temporal_msm:
+            dt = dt + self.motion_dt_logits(hidden_states)
         B_param = rearrange(B_param, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
         C_param = rearrange(C_param, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
         # print(x.shape[-1])
