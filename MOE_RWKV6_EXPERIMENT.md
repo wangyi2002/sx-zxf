@@ -201,6 +201,22 @@ Important:
 
 > GPU training behavior is unchanged. CUDA inputs still use the original optimized `mamba_ssm` selective scan and will raise an error if `mamba-ssm` is unavailable.
 
+### `tools/cpu_smoke_test_moe.py`
+
+Reusable verification script. It:
+
+- instantiates the production H36M model for exact parameter counting
+- instantiates the original baseline for comparison
+- runs the full 30-layer MoE architecture on CPU with a short sequence
+- validates output and router shapes
+- checks that outputs are finite
+
+Run:
+
+```bash
+python tools/cpu_smoke_test_moe.py
+```
+
 ### `configs/h36m/MotionAGFormer-moe-rwkv6.yaml`
 
 Contains the lightweight MoE hyperparameters.
@@ -223,6 +239,31 @@ For this experimental branch, every future model-code modification should be fol
 6. Trainable parameter count.
 
 The CPU selective-scan reference exists specifically to support this smoke-test workflow. It is not intended for speed benchmarking or final training.
+
+### Latest verified result
+
+Production H36M configuration (`n_layers=30`, `dim_feat=128`, `n_frames=243`):
+
+```text
+Lightweight MoE parameters: 12,072,527
+Baseline parameters:        11,342,421
+Increase:                      730,106  (+6.44%)
+```
+
+MoE layer indices:
+
+```text
+[0, 1, 2, 3, 4, 5, 6, 7, 8, 20, 21, 22, 23]
+```
+
+CPU smoke test used the full 30-layer schedule with `B=1`, `T=9`, `J=17`:
+
+```text
+output shape:        [1, 9, 17, 3]
+router tensor count: 13
+router shape:        [1, 9, 17, 2]
+finite outputs:      PASS
+```
 
 ---
 
