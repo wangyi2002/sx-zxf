@@ -2,24 +2,24 @@ import torch
 import torch.nn as nn
 
 from model.modules.mamba import MAM
-from model.modules.rwkv6 import RWKV6TemporalExpert
+from model.modules.rwkv6 import RWKV6TimeMixTemporalExpert
 from model.modules.mlp import MLP
 from timm.models.layers import DropPath
 
 
 class TemporalMoE(nn.Module):
-    """Dense soft temporal MoE with Mamba and RWKV-6 experts.
+    """Dense soft temporal MoE with full-width Mamba and lightweight RWKV-6.
 
     Input / output: [B, T, J, C]
     Router output: [B, T, J, 2]
 
-    Both experts always process the complete temporal sequence. The router only
-    controls the fusion weights, so frame-wise weights do not break temporal
-    continuity inside either expert.
+    Both experts process the complete temporal sequence. The RWKV branch is a
+    lightweight complementary expert: C -> rwkv_dim -> TimeMix -> C.
     """
 
-    def __init__(self, dim, layer_id, num_layers, router_hidden_ratio=0.5,
-                 rwkv_head_size=32, rwkv_ffn_mult=3.5, dropout=0.0):
+    def __init__(self, dim, layer_id, num_layers, router_hidden_ratio=0.25,
+                 rwkv_dim=64, rwkv_head_size=32,
+                 rwkv_mix_rank=16, rwkv_decay_rank=32):
         super().__init__()
 
         router_hidden = max(16, int(dim * router_hidden_ratio))
@@ -31,13 +31,14 @@ class TemporalMoE(nn.Module):
             expand=1,
             mode='temporal',
         )
-        self.rwkv_expert = RWKV6TemporalExpert(
+        self.rwkv_expert = RWKV6TimeMixTemporalExpert(
             dim=dim,
             layer_id=layer_id,
             num_layers=num_layers,
+            expert_dim=rwkv_dim,
             head_size=rwkv_head_size,
-            ffn_mult=rwkv_ffn_mult,
-            dropout=dropout,
+            mix_rank=rwkv_mix_rank,
+            decay_rank=rwkv_decay_rank,
         )
         self.router = nn.Sequential(
             nn.Linear(dim, router_hidden),
@@ -69,8 +70,9 @@ class TemporalMoEBlock(nn.Module):
 
     def __init__(self, dim, layer_id, num_layers, mlp_ratio=4., act_layer=nn.GELU,
                  drop=0., drop_path=0., use_layer_scale=True,
-                 layer_scale_init_value=1e-5, router_hidden_ratio=0.5,
-                 rwkv_head_size=32, rwkv_ffn_mult=3.5):
+                 layer_scale_init_value=1e-5, router_hidden_ratio=0.25,
+                 rwkv_dim=64, rwkv_head_size=32,
+                 rwkv_mix_rank=16, rwkv_decay_rank=32):
         super().__init__()
 
         self.norm1 = nn.LayerNorm(dim)
@@ -79,9 +81,10 @@ class TemporalMoEBlock(nn.Module):
             layer_id=layer_id,
             num_layers=num_layers,
             router_hidden_ratio=router_hidden_ratio,
+            rwkv_dim=rwkv_dim,
             rwkv_head_size=rwkv_head_size,
-            rwkv_ffn_mult=rwkv_ffn_mult,
-            dropout=drop,
+            rwkv_mix_rank=rwkv_mix_rank,
+            rwkv_decay_rank=rwkv_decay_rank,
         )
 
         self.norm2 = nn.LayerNorm(dim)
