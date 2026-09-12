@@ -66,9 +66,11 @@ def load_model(args):
     elif args.model_name == "MotionAGFormerMoE":
         model = MotionAGFormerMoE(
             **common_kwargs,
-            router_hidden_ratio=getattr(args, 'router_hidden_ratio', 0.5),
+            router_hidden_ratio=getattr(args, 'router_hidden_ratio', 0.25),
+            rwkv_dim=getattr(args, 'rwkv_dim', 64),
             rwkv_head_size=getattr(args, 'rwkv_head_size', 32),
-            rwkv_ffn_mult=getattr(args, 'rwkv_ffn_mult', 3.5),
+            rwkv_mix_rank=getattr(args, 'rwkv_mix_rank', 16),
+            rwkv_decay_rank=getattr(args, 'rwkv_decay_rank', 32),
         )
     else:
         raise Exception("Undefined model name")
