@@ -32,10 +32,14 @@ use_tcn: False
 graph_only: False
 n_frames: 243
 
-# Temporal MoE
-router_hidden_ratio: 0.5
+# Lightweight Temporal MoE
+# Only the 13 blocks that are Mamba blocks in the original 30-layer schedule use MoE.
+# Attention blocks remain Spatial Attention -> Temporal Attention.
+router_hidden_ratio: 0.25
+rwkv_dim: 64
 rwkv_head_size: 32
-rwkv_ffn_mult: 3.5
+rwkv_mix_rank: 16
+rwkv_decay_rank: 32
 
 # Data
 data_root: data/motion3d/
