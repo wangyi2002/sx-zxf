@@ -4,12 +4,11 @@ import torch.nn.functional as F
 
 
 class RWKV6TimeMix(nn.Module):
-    """Pure PyTorch RWKV-6/Finch-style temporal mixer for pose sequences.
+    """Pure PyTorch RWKV-6/Finch-style temporal mixer.
 
-    Input / output: [N, T, C]. In the pose wrapper N = B * J.
-    This reference implementation keeps the RWKV-6 data-dependent time mixing,
-    dynamic decay and matrix-valued recurrent state, but intentionally avoids a
-    custom CUDA WKV kernel so the experimental branch is easy to run first.
+    Input / output: [N, T, C]. This reference implementation keeps the
+    data-dependent time mixing, dynamic decay and matrix-valued recurrent state.
+    It intentionally avoids a custom CUDA WKV kernel for architecture validation.
     """
 
     def __init__(self, dim, layer_id, num_layers, head_size=32,
@@ -34,7 +33,7 @@ class RWKV6TimeMix(nn.Module):
         self.time_maa_r = nn.Parameter(1.0 - torch.pow(ddd, 0.5 * ratio_1_to_almost0))
         self.time_maa_g = nn.Parameter(1.0 - torch.pow(ddd, 0.5 * ratio_1_to_almost0))
 
-        # Data-dependent offsets for w, k, v, r, g.
+        # Low-rank, data-dependent offsets for w, k, v, r, g.
         self.time_maa_w1 = nn.Parameter(torch.zeros(dim, mix_rank * 5))
         self.time_maa_w2 = nn.Parameter(torch.empty(5, mix_rank, dim))
         nn.init.uniform_(self.time_maa_w2, -0.01, 0.01)
@@ -65,11 +64,7 @@ class RWKV6TimeMix(nn.Module):
         return prev - x
 
     def _wkv6_reference(self, r, k, v, w):
-        """Reference recurrent WKV6 operator.
-
-        This is deliberately written as a Python loop over time. It is suitable
-        for correctness / ablation experiments, not for final speed benchmarks.
-        """
+        """Reference recurrent WKV6 operator using a Python loop over time."""
         n, t, d = r.shape
         h, s = self.num_heads, self.head_size
 
@@ -131,6 +126,51 @@ class RWKV6TimeMix(nn.Module):
         return self.output(y * g)
 
 
+class RWKV6TimeMixTemporalExpert(nn.Module):
+    """Lightweight pose temporal expert using RWKV-6 TimeMix only.
+
+    The shared backbone feature is projected into a smaller expert dimension,
+    modeled temporally, then projected back:
+
+        [B,T,J,C] -> C->E -> RWKV6 TimeMix(E) -> E->C -> [B,T,J,C]
+
+    There is intentionally no RWKV ChannelMix here because the outer
+    TemporalMoEBlock already has a shared AGFormer MLP after expert fusion.
+    """
+
+    def __init__(self, dim, layer_id, num_layers, expert_dim=64,
+                 head_size=32, mix_rank=16, decay_rank=32):
+        super().__init__()
+        if expert_dim % head_size != 0:
+            raise ValueError(
+                f"expert_dim={expert_dim} must be divisible by head_size={head_size}"
+            )
+
+        self.dim = dim
+        self.expert_dim = expert_dim
+        self.down_proj = nn.Linear(dim, expert_dim, bias=False)
+        self.norm = nn.LayerNorm(expert_dim)
+        self.time_mix = RWKV6TimeMix(
+            dim=expert_dim,
+            layer_id=layer_id,
+            num_layers=num_layers,
+            head_size=head_size,
+            mix_rank=mix_rank,
+            decay_rank=decay_rank,
+        )
+        self.up_proj = nn.Linear(expert_dim, dim, bias=False)
+
+    def forward(self, x):
+        b, t, j, c = x.shape
+        seq = x.permute(0, 2, 1, 3).contiguous().view(b * j, t, c)
+        seq = self.down_proj(seq)
+        seq = self.time_mix(self.norm(seq))
+        seq = self.up_proj(seq)
+        return seq.view(b, j, t, c).permute(0, 2, 1, 3).contiguous()
+
+
+# Full RWKV-6 block is retained for later ablations, but is not used by the
+# lightweight MoE configuration below.
 class RWKV6ChannelMix(nn.Module):
     def __init__(self, dim, layer_id, num_layers, ffn_mult=3.5):
         super().__init__()
@@ -181,7 +221,7 @@ class RWKV6Block(nn.Module):
 
 
 class RWKV6TemporalExpert(nn.Module):
-    """Pose wrapper: [B, T, J, C] -> [B, T, J, C]."""
+    """Full RWKV-6 pose wrapper retained for ablations."""
 
     def __init__(self, dim, layer_id, num_layers, head_size=32,
                  ffn_mult=3.5, dropout=0.0):
