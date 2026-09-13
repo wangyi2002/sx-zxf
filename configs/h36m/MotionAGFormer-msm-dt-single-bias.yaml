@@ -54,7 +54,9 @@ use_proj_as_2d: False
 flip: True
 
 # SX-MSM-01: keep all other settings identical to the original base config.
+# Direct time-convolution dt; no original temporal dt projection or residual.
 temporal_msm: True
+# Applies only to spatial / MSM-disabled MAM. Direct temporal MSM adds its bias once.
 mamba_dt_bias_mode: single
 
 # SX-MSM-02: clipping every step; detached DT/pose sampling every 100 batches.

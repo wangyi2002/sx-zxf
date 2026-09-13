@@ -64,7 +64,7 @@ class TrainingMonitor:
         self.active = self.every > 0 and step % self.every == 0
 
     @torch.no_grad()
-    def dt(self, name, logits, residual, bias):
+    def dt(self, name, logits, _unused_residual, bias):
         if not self.active:
             return
         logits = logits.detach().float()
@@ -79,16 +79,6 @@ class TrainingMonitor:
         stride = max(1, math.ceil(flat.numel() / 4096))
         self.add(prefix + "dt_p99_sampled", torch.quantile(flat[::stride], 0.99).item(), "max")
         self.add(prefix + "dt_below_1e-5_fraction", (effective < 1e-5).float().mean().item(), weight=flat.numel())
-        if residual is not None:
-            residual = residual.detach().float()
-            base = logits - residual + bias
-            residual_rms = residual.square().mean().sqrt()
-            base_rms = base.square().mean().sqrt()
-            self.add(prefix + "residual_rms", residual_rms.item(), weight=flat.numel())
-            self.add(prefix + "residual_to_base_logit_rms", (residual_rms / base_rms.clamp_min(1e-12)).item(), "max")
-            base_dt = F.softplus(base).mean()
-            self.add(prefix + "dt_to_baseline_mean_ratio", (effective.mean() / base_dt.clamp_min(1e-12)).item(), "max")
-
     @torch.no_grad()
     def pose(self, pred, target):
         if not self.active:
@@ -121,7 +111,7 @@ raise before updating weights; clipping is not a NaN repair mechanism.
         raise ValueError("grad_clip_norm must be finite and >= 0")
     parameters = [p for p in model.parameters() if p.grad is not None]
     msm_grads = [p.grad.detach().float().norm() for n, p in model.named_parameters()
-                 if n.endswith("msm_dt_weight") and p.grad is not None]
+                 if n.endswith(("msm_dt_weight", "dt_bias")) and p.grad is not None]
     if msm_grads:
         msm_norm = torch.stack(msm_grads).norm().item()
         monitor.add("grad/msm_norm_mean", msm_norm)
