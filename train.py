@@ -23,6 +23,7 @@ from utils.tools import set_random_seed, get_config, print_args, create_director
 from torch.utils.data import DataLoader
 
 from utils.learning import load_model, AverageMeter, decay_lr_exponentially
+from utils.training_monitor import TrainingMonitor, clip_and_monitor_gradients
 from utils.tools import count_param_numbers
 from utils.data import Augmenter2D
 
@@ -48,47 +49,60 @@ def parse_args():
 
 def train_one_epoch(args, model, train_loader, optimizer, device, losses):
     model.train()
-    for x, y in tqdm(train_loader):
-        batch_size = x.shape[0]
-        x, y = x.to(device), y.to(device)
+    monitor = TrainingMonitor(getattr(args, "monitor_every", 0))
+    monitor.attach(model)
+    try:
+        for batch_idx, (x, y) in enumerate(tqdm(train_loader)):
+            monitor.begin_batch(batch_idx)
+            batch_size = x.shape[0]
+            x, y = x.to(device), y.to(device)
 
-        with torch.no_grad():
-            if args.root_rel:
-                y = y - y[..., 0:1, :]
-            else:
-                y[..., 2] = y[..., 2] - y[:, 0:1, 0:1, 2]  # Place the depth of first frame root to be 0
+            with torch.no_grad():
+                if args.root_rel:
+                    y = y - y[..., 0:1, :]
+                else:
+                    y[..., 2] = y[..., 2] - y[:, 0:1, 0:1, 2]  # Place the depth of first frame root to be 0
 
-        pred = model(x)  # (N, T, 17, 3)
+            pred = model(x)  # (N, T, 17, 3)
 
-        optimizer.zero_grad()
+            monitor.pose(pred, y)
+            optimizer.zero_grad()
 
-        loss_3d_pos = loss_mpjpe(pred, y)
-        loss_3d_scale = n_mpjpe(pred, y)
-        loss_3d_velocity = loss_velocity(pred, y)
-        loss_lv = loss_limb_var(pred)
-        loss_lg = loss_limb_gt(pred, y)
-        loss_a = loss_angle(pred, y)
-        loss_av = loss_angle_velocity(pred, y)
+            loss_3d_pos = loss_mpjpe(pred, y)
+            loss_3d_scale = n_mpjpe(pred, y)
+            loss_3d_velocity = loss_velocity(pred, y)
+            loss_lv = loss_limb_var(pred)
+            loss_lg = loss_limb_gt(pred, y)
+            loss_a = loss_angle(pred, y)
+            loss_av = loss_angle_velocity(pred, y)
 
-        loss_total = loss_3d_pos + \
-                    args.lambda_scale * loss_3d_scale + \
-                    args.lambda_3d_velocity * loss_3d_velocity + \
-                    args.lambda_lv * loss_lv + \
-                    args.lambda_lg * loss_lg + \
-                    args.lambda_a * loss_a + \
-                    args.lambda_av * loss_av
+            loss_total = loss_3d_pos + \
+                        args.lambda_scale * loss_3d_scale + \
+                        args.lambda_3d_velocity * loss_3d_velocity + \
+                        args.lambda_lv * loss_lv + \
+                        args.lambda_lg * loss_lg + \
+                        args.lambda_a * loss_a + \
+                        args.lambda_av * loss_av
 
-        losses['3d_pose'].update(loss_3d_pos.item(), batch_size)
-        losses['3d_scale'].update(loss_3d_scale.item(), batch_size)
-        losses['3d_velocity'].update(loss_3d_velocity.item(), batch_size)
-        losses['lv'].update(loss_lv.item(), batch_size)
-        losses['lg'].update(loss_lg.item(), batch_size)
-        losses['angle'].update(loss_a.item(), batch_size)
-        losses['angle_velocity'].update(loss_av.item(), batch_size)
-        losses['total'].update(loss_total.item(), batch_size)
+            if not torch.isfinite(loss_total).item():
+                raise FloatingPointError(f"Nonfinite training loss at batch {batch_idx}; optimizer not updated")
 
-        loss_total.backward()
-        optimizer.step()
+            losses['3d_pose'].update(loss_3d_pos.item(), batch_size)
+            losses['3d_scale'].update(loss_3d_scale.item(), batch_size)
+            losses['3d_velocity'].update(loss_3d_velocity.item(), batch_size)
+            losses['lv'].update(loss_lv.item(), batch_size)
+            losses['lg'].update(loss_lg.item(), batch_size)
+            losses['angle'].update(loss_a.item(), batch_size)
+            losses['angle_velocity'].update(loss_av.item(), batch_size)
+            losses['total'].update(loss_total.item(), batch_size)
+
+            loss_total.backward()
+            clip_and_monitor_gradients(model, getattr(args, "grad_clip_norm", 0.0), monitor)
+            optimizer.step()
+    finally:
+        monitor.close()
+    return monitor.summary()
+
 
 def evaluate(args, model, test_loader, datareader, device):
     print("[INFO] Evaluation")
@@ -319,7 +333,8 @@ def train(args, opts):
         loss_names = ['3d_pose', '3d_scale', '2d_proj', 'lg', 'lv', '3d_velocity', 'angle', 'angle_velocity', 'total']
         losses = {name: AverageMeter() for name in loss_names}
 
-        train_one_epoch(args, model, train_loader, optimizer, device, losses)
+        diagnostics = train_one_epoch(args, model, train_loader, optimizer, device, losses)
+        print("[MONITOR]", {k: v for k, v in diagnostics.items() if not k.startswith("msm/")})
 
         mpjpe, p_mpjpe, joints_error, acceleration_error = evaluate(args, model, test_loader, datareader, device)
 
@@ -334,6 +349,7 @@ def train(args, opts):
         if opts.use_wandb:
             wandb.log({
                 'lr': lr,
+                **diagnostics,
                 'train/loss_3d_pose': losses['3d_pose'].avg,
                 'train/loss_3d_scale': losses['3d_scale'].avg,
                 'train/loss_3d_velocity': losses['3d_velocity'].avg,

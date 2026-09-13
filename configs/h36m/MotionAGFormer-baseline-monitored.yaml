@@ -53,10 +53,8 @@ lambda_av: 0.0
 use_proj_as_2d: False
 flip: True
 
-# SX-MSM-01: keep all other settings identical to the original base config.
-temporal_msm: True
+# SX-MSM-02: matched clipping/monitoring baseline without MSM.
+temporal_msm: False
 mamba_dt_bias_mode: legacy_double
-
-# SX-MSM-02: clipping every step; detached DT/pose sampling every 100 batches.
-grad_clip_norm: 1.0   # 0 disables clipping for an exact optimization control
-monitor_every: 100   # 0 disables DT/pose sampling; gradient metrics remain
+grad_clip_norm: 1.0
+monitor_every: 100

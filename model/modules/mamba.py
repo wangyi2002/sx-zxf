@@ -148,8 +148,13 @@ class MAM(nn.Module):
         projected_dt = (self.dt_proj(dt) if self.dt_bias_mode == "legacy_double"
                         else F.linear(dt, self.dt_proj.weight))
         dt = rearrange(projected_dt, "(b l) d -> b d l", l=seqlen)
+        residual_dt = None
         if self.temporal_msm:
-            dt = dt + self.motion_dt_logits(hidden_states)
+            residual_dt = self.motion_dt_logits(hidden_states)
+            dt = dt + residual_dt
+        observer = getattr(self, "dt_observer", None)
+        if observer is not None:
+            observer(dt, residual_dt, self.dt_proj.bias)
         B_param = rearrange(B_param, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
         C_param = rearrange(C_param, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
         # print(x.shape[-1])

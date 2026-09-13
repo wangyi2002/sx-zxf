@@ -1,5 +1,8 @@
 # SX-MSM-01：师兄 Mamba1 架构上的时间动态 Δt
 
+> 本文记录 `ee5c34c` 的初版实验。当前分支配置已加入梯度裁剪与监控，
+> 参见 [SX-MSM-02](SX-MSM-02.md)。若要保持初版优化策略，设 `grad_clip_norm: 0`。
+
 - 日期：2026-09-12
 - 分支：`feat/msm-dt-v1`
 - 基于：`wangyi2002/sx-zxf/main`，提交 `a2346dd89a1d7edf696475f61631d5145a8d45e9`
