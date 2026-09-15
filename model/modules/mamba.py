@@ -3,7 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from einops import rearrange, repeat
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+from model.modules.scan_backend import selective_scan_fn
+from model.modules.ssi import FixedSkeletonFeatureFusion
 
 
 class MAM(nn.Module):
@@ -27,6 +28,7 @@ class MAM(nn.Module):
             layer_idx=None,
             device=None,
             dtype=None,
+            spatial_ssi=False,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -35,6 +37,7 @@ class MAM(nn.Module):
         self.d_conv = d_conv
         self.expand = expand
         self.mode = mode
+        self.spatial_ssi = bool(spatial_ssi) and mode == "spatial"
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
         self.use_fast_path = use_fast_path
@@ -99,6 +102,9 @@ class MAM(nn.Module):
             **factory_kwargs,
         )
 
+        # SSI-01: fixed feature fusion only. No additional trainable weights.
+        self.ssi = FixedSkeletonFeatureFusion(device=device) if self.spatial_ssi else None
+
     def forward(self, hidden_states):
         B, T, J, C = hidden_states.shape
 
@@ -123,6 +129,11 @@ class MAM(nn.Module):
         A = -torch.exp(self.A_log.float())
         x = F.silu(F.conv1d(x, self.conv1d_x.weight, self.conv1d_x.bias, padding='same', groups=self.d_inner // 2))
         z = F.silu(F.conv1d(z, self.conv1d_z.weight, self.conv1d_z.bias, padding='same', groups=self.d_inner // 2))
+
+        # The existing convolution/activation has completed. Only x is fused;
+        # z is unchanged. B/C/dt and the scan consume this fused x.
+        if self.ssi is not None:
+            x = self.ssi(x)
 
         x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
         dt, B_param, C_param = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)

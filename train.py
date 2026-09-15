@@ -23,6 +23,7 @@ from utils.tools import set_random_seed, get_config, print_args, create_director
 from torch.utils.data import DataLoader
 
 from utils.learning import load_model, AverageMeter, decay_lr_exponentially
+from utils.gradient_monitor import GradientMonitor
 from utils.tools import count_param_numbers
 from utils.data import Augmenter2D
 
@@ -48,6 +49,7 @@ def parse_args():
 
 def train_one_epoch(args, model, train_loader, optimizer, device, losses):
     model.train()
+    gradient_monitor = GradientMonitor(getattr(args, "grad_clip_norm", 0.0))
     for x, y in tqdm(train_loader):
         batch_size = x.shape[0]
         x, y = x.to(device), y.to(device)
@@ -78,6 +80,9 @@ def train_one_epoch(args, model, train_loader, optimizer, device, losses):
                     args.lambda_a * loss_a + \
                     args.lambda_av * loss_av
 
+        if not torch.isfinite(loss_total).item():
+            raise FloatingPointError("Nonfinite training loss; optimizer not updated")
+
         losses['3d_pose'].update(loss_3d_pos.item(), batch_size)
         losses['3d_scale'].update(loss_3d_scale.item(), batch_size)
         losses['3d_velocity'].update(loss_3d_velocity.item(), batch_size)
@@ -88,7 +93,9 @@ def train_one_epoch(args, model, train_loader, optimizer, device, losses):
         losses['total'].update(loss_total.item(), batch_size)
 
         loss_total.backward()
+        gradient_monitor.clip(model)
         optimizer.step()
+    return gradient_monitor.summary()
 
 def evaluate(args, model, test_loader, datareader, device):
     print("[INFO] Evaluation")
@@ -319,7 +326,8 @@ def train(args, opts):
         loss_names = ['3d_pose', '3d_scale', '2d_proj', 'lg', 'lv', '3d_velocity', 'angle', 'angle_velocity', 'total']
         losses = {name: AverageMeter() for name in loss_names}
 
-        train_one_epoch(args, model, train_loader, optimizer, device, losses)
+        diagnostics = train_one_epoch(args, model, train_loader, optimizer, device, losses)
+        print("[MONITOR]", diagnostics)
 
         mpjpe, p_mpjpe, joints_error, acceleration_error = evaluate(args, model, test_loader, datareader, device)
 
@@ -334,6 +342,7 @@ def train(args, opts):
         if opts.use_wandb:
             wandb.log({
                 'lr': lr,
+                **diagnostics,
                 'train/loss_3d_pose': losses['3d_pose'].avg,
                 'train/loss_3d_scale': losses['3d_scale'].avg,
                 'train/loss_3d_velocity': losses['3d_velocity'].avg,
