@@ -56,7 +56,10 @@ def load_model(args):
                                graph_only=args.graph_only,
                                neighbour_num=args.neighbour_num,
                                n_frames=args.n_frames,
-                               spatial_ssi=getattr(args, "spatial_ssi", False))
+                               spatial_ssi=getattr(args, "spatial_ssi", False),
+                               spatial_state_ssi=getattr(args, "spatial_state_ssi", False),
+                               temporal_msm=getattr(args, "temporal_msm", False),
+                               state_ssi_chunk_size=getattr(args, "state_ssi_chunk_size", 32))
     else:
         raise Exception("Undefined model name")
 

@@ -5,6 +5,7 @@ import math
 from einops import rearrange, repeat
 from model.modules.scan_backend import selective_scan_fn
 from model.modules.ssi import FixedSkeletonFeatureFusion
+from model.modules.state_ssi import state_ssi_scan
 
 
 class MAM(nn.Module):
@@ -29,6 +30,10 @@ class MAM(nn.Module):
             device=None,
             dtype=None,
             spatial_ssi=False,
+            spatial_state_ssi=False,
+            state_ssi_chunk_size=32,
+            temporal_msm=False,
+            dt_bias_mode="legacy_double",
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -37,36 +42,47 @@ class MAM(nn.Module):
         self.d_conv = d_conv
         self.expand = expand
         self.mode = mode
-        self.spatial_ssi = bool(spatial_ssi) and mode == "spatial"
+        if dt_bias_mode not in ("legacy_double", "single"):
+            raise ValueError("dt_bias_mode must be legacy_double or single")
+        self.dt_bias_mode = dt_bias_mode
+        self.temporal_msm = bool(temporal_msm) and mode == "temporal"
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
         self.use_fast_path = use_fast_path
         self.layer_idx = layer_idx
 
-        # Projection layers
+        # With temporal MSM enabled, x_proj generates B/C only. The original
+        # low-rank dt features and dt_proj do not exist in this path.
         self.in_proj = nn.Linear(self.d_model, self.d_inner, bias=bias, **factory_kwargs)
         self.x_proj = nn.Linear(
-            self.d_inner // 2, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
+            self.d_inner // 2,
+            self.d_state * 2 if self.temporal_msm else self.dt_rank + self.d_state * 2,
+            bias=False, **factory_kwargs
         )
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner // 2, bias=True, **factory_kwargs)
-
-        # Initialize dt_proj weights
-        dt_init_std = self.dt_rank ** -0.5 * dt_scale
-        if dt_init == "constant":
-            nn.init.constant_(self.dt_proj.weight, dt_init_std)
-        elif dt_init == "random":
-            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+        if self.temporal_msm:
+            self.dt_bias = nn.Parameter(torch.empty(self.d_inner // 2, **factory_kwargs))
+            dt_bias = self.dt_bias
         else:
-            raise NotImplementedError
+            # Preserve the original spatial / MSM-disabled implementation.
+            self.dt_proj = nn.Linear(self.dt_rank, self.d_inner // 2, bias=True, **factory_kwargs)
+            dt_init_std = self.dt_rank ** -0.5 * dt_scale
+            if dt_init == "constant":
+                nn.init.constant_(self.dt_proj.weight, dt_init_std)
+            elif dt_init == "random":
+                nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+            else:
+                raise NotImplementedError
+            dt_bias = self.dt_proj.bias
 
-        # Initialize dt_proj bias motionagformer-b-h36m.pth.tr
+        # Initialize the positive time scale via inverse softplus. Direct MSM
+        # adds this bias exactly once in the scan, not inside the convolution.
         dt = torch.exp(
             torch.rand(self.d_inner // 2, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
         ).clamp(min=dt_init_floor)
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         with torch.no_grad():
-            self.dt_proj.bias.copy_(inv_dt)
-        self.dt_proj.bias._no_reinit = True
+            dt_bias.copy_(inv_dt)
+        dt_bias._no_reinit = True
 
         # State parameters
         A = repeat(
@@ -102,8 +118,24 @@ class MAM(nn.Module):
             **factory_kwargs,
         )
 
-        # SSI-01: fixed feature fusion only. No additional trainable weights.
-        self.ssi = FixedSkeletonFeatureFusion(device=device) if self.spatial_ssi else None
+        # Direct two-frame dt generator: [previous, current], left zero pad.
+        # Nonzero standard convolution initialization makes dt input-dependent
+        # from the start; there is no retained baseline dt or residual gate.
+        if self.temporal_msm:
+            self.msm_dt_weight = nn.Parameter(torch.empty(
+                self.d_inner // 2, self.d_model, 2, **factory_kwargs
+            ))
+            nn.init.kaiming_uniform_(self.msm_dt_weight, a=math.sqrt(5))
+
+        self.ssi = FixedSkeletonFeatureFusion(device=device) if spatial_ssi and mode == 'spatial' else None
+        self.state_ssi = FixedSkeletonFeatureFusion(device=device) if spatial_state_ssi and mode == 'spatial' else None
+        self.state_ssi_chunk_size = int(state_ssi_chunk_size)
+        if self.state_ssi_chunk_size < 1:
+            raise ValueError('state_ssi_chunk_size must be positive')
+
+    def motion_dt_logits(self, u):
+        """[batch, time, C] -> [batch, SSM channels, time]; left zero padding."""
+        return F.conv1d(F.pad(u.transpose(1, 2), (1, 0)), self.msm_dt_weight)
 
     def forward(self, hidden_states):
         B, T, J, C = hidden_states.shape
@@ -130,20 +162,39 @@ class MAM(nn.Module):
         x = F.silu(F.conv1d(x, self.conv1d_x.weight, self.conv1d_x.bias, padding='same', groups=self.d_inner // 2))
         z = F.silu(F.conv1d(z, self.conv1d_z.weight, self.conv1d_z.bias, padding='same', groups=self.d_inner // 2))
 
-        # The existing convolution/activation has completed. Only x is fused;
-        # z is unchanged. B/C/dt and the scan consume this fused x.
         if self.ssi is not None:
             x = self.ssi(x)
-
         x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
-        dt, B_param, C_param = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        dt = rearrange(self.dt_proj(dt), "(b l) d -> b d l", l=seqlen)
+        if self.temporal_msm:
+            B_param, C_param = torch.split(x_dbl, [self.d_state, self.d_state], dim=-1)
+            dt = self.motion_dt_logits(hidden_states)
+            scan_dt_bias = self.dt_bias
+        else:
+            dt, B_param, C_param = torch.split(
+                x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1
+            )
+            projected_dt = (self.dt_proj(dt) if self.dt_bias_mode == "legacy_double"
+                            else F.linear(dt, self.dt_proj.weight))
+            dt = rearrange(projected_dt, "(b l) d -> b d l", l=seqlen)
+            scan_dt_bias = self.dt_proj.bias
+        observer = getattr(self, "dt_observer", None)
+        if observer is not None:
+            observer(dt, None, scan_dt_bias)
+        joint_observer = getattr(self, 'joint_dt_observer', None)
+        if joint_observer is not None and self.mode == 'temporal':
+            joint_observer(dt, scan_dt_bias, B, J)
         B_param = rearrange(B_param, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
         C_param = rearrange(C_param, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
         # print(x.shape[-1])
         # 选择性扫描
-        y = selective_scan_fn(x, dt, A, B_param, C_param, self.D.float(), z=None,
-                              delta_bias=self.dt_proj.bias.float(), delta_softplus=True)
+        if self.state_ssi is not None:
+            # Custom state readout; does NOT modify the installed official library.
+            y = state_ssi_scan(x, dt, A, B_param, C_param, self.D.float(),
+                               scan_dt_bias.float(), self.state_ssi.graph,
+                               self.state_ssi_chunk_size)
+        else:
+            y = selective_scan_fn(x, dt, A, B_param, C_param, self.D.float(), z=None,
+                                  delta_bias=scan_dt_bias.float(), delta_softplus=True)
 
         # 输出处理
         y = torch.cat([y, z], dim=1)
@@ -157,9 +208,6 @@ class MAM(nn.Module):
             out = rearrange(out, '(b j) t c -> b t j c', b=B, j=J)
 
         return out
-
-
-
 
     # def forward(self, hidden_states):
     #         # 输入形状: [B, T, J, C]
