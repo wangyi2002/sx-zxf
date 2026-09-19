@@ -3,4 +3,11 @@
 *.pyc
 wandb
 checkpoint/*.pth.tr
-*data
+/data/*
+!/data/__init__.py
+!/data/const.py
+!/data/reader/
+/data/reader/*
+!/data/reader/*.py
+__pycache__/
+depth_outputs/
