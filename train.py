@@ -88,6 +88,15 @@ def train_one_epoch(args, model, train_loader, optimizer, device, losses):
         losses['total'].update(loss_total.item(), batch_size)
 
         loss_total.backward()
+        if args.grad_clip_norm > 0:
+            # Global L2 norm across all parameters; fail before step on NaN/Inf.
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=args.grad_clip_norm,
+                norm_type=2.0, error_if_nonfinite=True)
+            # clip_grad_norm_ returns the norm BEFORE clipping.
+            grad_norm_value = grad_norm.item()
+            losses['grad_norm'].update(grad_norm_value)
+            losses['grad_clip_fraction'].update(float(grad_norm_value > args.grad_clip_norm))
         optimizer.step()
 
 def evaluate(args, model, test_loader, datareader, device):
@@ -233,6 +242,10 @@ def save_checkpoint(checkpoint_path, epoch, lr, optimizer, model, min_mpjpe, wan
 
 
 def train(args, opts):
+    # Default applies to older H36M configs too; 0 explicitly disables clipping.
+    args.grad_clip_norm = float(getattr(args, 'grad_clip_norm', 1.0))
+    if not np.isfinite(args.grad_clip_norm) or args.grad_clip_norm < 0:
+        raise ValueError("grad_clip_norm must be finite and >= 0")
     print_args(args)
     create_directory_if_not_exists(opts.new_checkpoint)
 
@@ -316,10 +329,14 @@ def train(args, opts):
             exit()
 
         print(f"[INFO] epoch {epoch}")
-        loss_names = ['3d_pose', '3d_scale', '2d_proj', 'lg', 'lv', '3d_velocity', 'angle', 'angle_velocity', 'total']
+        loss_names = ['3d_pose', '3d_scale', '2d_proj', 'lg', 'lv', '3d_velocity', 'angle', 'angle_velocity', 'total', 'grad_norm', 'grad_clip_fraction']
         losses = {name: AverageMeter() for name in loss_names}
 
         train_one_epoch(args, model, train_loader, optimizer, device, losses)
+        if args.grad_clip_norm > 0:
+            print(f"[INFO] Gradient L2 norm before clipping (step mean): {losses['grad_norm'].avg:.4f}; "
+                  f"clipped steps: {losses['grad_clip_fraction'].avg:.1%}; "
+                  f"max norm: {args.grad_clip_norm}")
 
         mpjpe, p_mpjpe, joints_error, acceleration_error = evaluate(args, model, test_loader, datareader, device)
 
@@ -343,6 +360,11 @@ def train(args, opts):
                 'train/loss_angle': losses['angle'].avg,
                 'train/angle_velocity': losses['angle_velocity'].avg,
                 'train/total': losses['total'].avg,
+                **({
+                    'train/grad_norm_before_clip': losses['grad_norm'].avg,
+                    'train/grad_clip_fraction': losses['grad_clip_fraction'].avg,
+                    'train/grad_clip_max_norm': args.grad_clip_norm,
+                } if args.grad_clip_norm > 0 else {}),
                 'eval/mpjpe': mpjpe,
                 'eval/acceleration_error': acceleration_error,
                 'eval/min_mpjpe': min_mpjpe,
