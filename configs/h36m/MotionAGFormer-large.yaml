@@ -5,6 +5,7 @@ weight_decay: 0.01
 lr_decay: 0.99
 epochs: 60
 train_2d: False
+grad_clip_norm: 1.0 # Global gradient L2 norm limit; 0 disables clipping
 
 # Model
 model_name: MotionAGFormer
