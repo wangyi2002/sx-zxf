@@ -3,11 +3,12 @@
 *.pyc
 wandb
 checkpoint/*.pth.tr
-/data/*
-!/data/__init__.py
-!/data/const.py
-!/data/reader/
-/data/reader/*
-!/data/reader/*.py
+
+# 数据集
+/data/motion3d/
+# Python 缓存（所有目录）
 __pycache__/
+*.pyc
+
+
 depth_outputs/
