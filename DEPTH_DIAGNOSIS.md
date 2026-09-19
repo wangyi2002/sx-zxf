@@ -8,7 +8,7 @@
 先确定 baseline 的 Z 误差属于幅度、前后排序、骨骼结构还是时间变化问题。
 此阶段只评估已有 checkpoint，不训练新模型。
 
-- `model/`、`loss/`、`configs/`、`train.py` 均不修改，参数增量为 0。
+- 诊断初版不修改模型、loss 和训练；后续按用户要求在 `train.py` 加入梯度裁剪，并在 large 配置中启用。模型结构和 loss 公式不变，参数增量仍为 0。
 - 新入口 `diagnose_depth.py`，默认推理 batch=1，保留配置中的 flip 测试增强。
 - 恢复用户提供的 `data/reader/*.py` 和 `data/const.py`；`h36m(1).py` 放回 `data/reader/h36m.py`。
 - `.gitignore` 只允许 data 下这些源码进入版本控制，数据集、切片、权重和诊断输出不提交。
@@ -110,3 +110,23 @@ python tools/smoke_depth.py
 - CPU scan 在已知闭式递推样例上通过校验。
 - 测试环境为 Python 3.12、PyTorch 2.5.1+cpu、timm 0.9.16、einops 0.8.2。仓库锁定的 timm 0.6.11 在 Python 3.12 下存在 dataclass 导入错误，因此只在临时测试环境使用 0.9.16；requirements.txt 未修改。
 - 尚未运行真实 H36M checkpoint、GPU kernel 或测量 GPU 显存/速度，不能据此报告精度提升或 GPU 数值一致性。
+
+## 后续训练稳定性更新：梯度裁剪
+
+按用户要求，在 H36M 的 train.py 中加入全局 L2 梯度范数裁剪：
+反向传播 → clip_grad_norm_ → optimizer.step。
+large 配置新增 `grad_clip_norm: 1.0`；其他 H36M 配置未写该项时也默认 1.0，设置为 0 可关闭。
+阈值是所有参数梯度合并后的范数上限，不是逐元素截断，也不是 loss 上限。
+
+开启裁剪时，NaN/Inf 梯度范数会在参数更新前报错停止，避免把非有限梯度写入参数。
+裁剪无法修复已经损坏的权重或优化器状态。恢复训练应使用异常发生之前的有效 checkpoint。
+当前运行进程需重启才能加载新代码；对照实验应记录裁剪阈值并保持一致。
+
+控制台每轮打印裁剪前范数的逐步均值和裁剪比例。
+开启 wandb 时新增：
+- `train/grad_norm_before_clip`：每轮裁剪前梯度范数的逐步均值；
+- `train/grad_clip_fraction`：该轮触发裁剪的训练步比例（0～1）；
+- `train/grad_clip_max_norm`：裁剪阈值。
+
+本次仅修改 train.py、large YAML 和说明文档。按用户明确要求未执行云端测试；
+上方的 CPU/单元测试结果属于此前诊断初版，不代表此次训练修改已测试。
