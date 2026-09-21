@@ -10,9 +10,7 @@ from pathlib import Path
 import numpy as np
 
 
-BONES = [(0, 1), (1, 2), (2, 3), (0, 4), (4, 5), (5, 6),
-         (0, 7), (7, 8), (8, 9), (9, 10), (8, 11), (11, 12),
-         (12, 13), (8, 14), (14, 15), (15, 16)]
+from data.const import H36M_BONES as BONES
 PAIRS = [(i, j) for i in range(17) for j in range(i + 1, 17)]
 BLOCK_LIST = {'s_09_act_05_subact_02', 's_09_act_10_subact_02',
               's_09_act_13_subact_01'}

@@ -9,7 +9,7 @@ from torch import optim
 from tqdm import tqdm
 
 from loss.pose3d import loss_mpjpe, n_mpjpe, loss_velocity, loss_limb_var, loss_limb_gt, loss_angle, \
-    loss_angle_velocity
+    loss_angle_velocity, relative_depth_loss
 from loss.pose3d import jpe as calculate_jpe
 from loss.pose3d import p_mpjpe as calculate_p_mpjpe
 from loss.pose3d import mpjpe as calculate_mpjpe
@@ -48,6 +48,8 @@ def parse_args():
 
 def train_one_epoch(args, model, train_loader, optimizer, device, losses):
     model.train()
+    use_relative_depth = getattr(args, 'use_relative_depth_loss', False)
+    relative_depth_weight = getattr(args, 'relative_depth_weight', 0.1)
     for x, y in tqdm(train_loader):
         batch_size = x.shape[0]
         x, y = x.to(device), y.to(device)
@@ -77,6 +79,14 @@ def train_one_epoch(args, model, train_loader, optimizer, device, losses):
                     args.lambda_lg * loss_lg + \
                     args.lambda_a * loss_a + \
                     args.lambda_av * loss_av
+
+        # Keep the original loss expression intact. Disabled means no auxiliary
+        # computation and no extra tensor operation on loss_total.
+        losses['original'].update(loss_total.item(), batch_size)
+        if use_relative_depth:
+            loss_relative_depth = relative_depth_loss(pred, y)
+            loss_total = loss_total + relative_depth_weight * loss_relative_depth
+            losses['relative_depth'].update(loss_relative_depth.item(), batch_size)
 
         losses['3d_pose'].update(loss_3d_pos.item(), batch_size)
         losses['3d_scale'].update(loss_3d_scale.item(), batch_size)
@@ -242,6 +252,15 @@ def save_checkpoint(checkpoint_path, epoch, lr, optimizer, model, min_mpjpe, wan
 
 
 def train(args, opts):
+    # Missing keys in existing configs preserve baseline training behavior.
+    args.use_relative_depth_loss = getattr(args, 'use_relative_depth_loss', False)
+    args.relative_depth_weight = float(getattr(args, 'relative_depth_weight', 0.1))
+    if not isinstance(args.use_relative_depth_loss, bool):
+        raise ValueError('use_relative_depth_loss must be a YAML boolean')
+    if not np.isfinite(args.relative_depth_weight) or args.relative_depth_weight < 0:
+        raise ValueError('relative_depth_weight must be finite and >= 0')
+    if args.use_relative_depth_loss and args.num_joints != 17:
+        raise ValueError('Relative depth supervision uses the H36M 17-joint skeleton')
     # Default applies to older H36M configs too; 0 explicitly disables clipping.
     args.grad_clip_norm = float(getattr(args, 'grad_clip_norm', 1.0))
     if not np.isfinite(args.grad_clip_norm) or args.grad_clip_norm < 0:
@@ -329,10 +348,14 @@ def train(args, opts):
             exit()
 
         print(f"[INFO] epoch {epoch}")
-        loss_names = ['3d_pose', '3d_scale', '2d_proj', 'lg', 'lv', '3d_velocity', 'angle', 'angle_velocity', 'total', 'grad_norm', 'grad_clip_fraction']
+        loss_names = ['3d_pose', '3d_scale', '2d_proj', 'lg', 'lv', '3d_velocity', 'angle', 'angle_velocity', 'total', 'grad_norm', 'grad_clip_fraction', 'original', 'relative_depth']
         losses = {name: AverageMeter() for name in loss_names}
 
         train_one_epoch(args, model, train_loader, optimizer, device, losses)
+        print(f"[INFO] Loss total: {losses['total'].avg:.6f}; "
+              f"pose: {losses['3d_pose'].avg:.6f}; original: {losses['original'].avg:.6f}; "
+              f"relative depth (unweighted): {losses['relative_depth'].avg:.6f}; "
+              f"enabled: {args.use_relative_depth_loss}; weight: {args.relative_depth_weight}")
         if args.grad_clip_norm > 0:
             print(f"[INFO] Gradient L2 norm before clipping (step mean): {losses['grad_norm'].avg:.4f}; "
                   f"clipped steps: {losses['grad_clip_fraction'].avg:.1%}; "
@@ -360,6 +383,10 @@ def train(args, opts):
                 'train/loss_angle': losses['angle'].avg,
                 'train/angle_velocity': losses['angle_velocity'].avg,
                 'train/total': losses['total'].avg,
+                'train/loss_original': losses['original'].avg,
+                'train/loss_relative_depth': losses['relative_depth'].avg,
+                'train/use_relative_depth_loss': int(args.use_relative_depth_loss),
+                'train/relative_depth_weight': args.relative_depth_weight,
                 **({
                     'train/grad_norm_before_clip': losses['grad_norm'].avg,
                     'train/grad_clip_fraction': losses['grad_clip_fraction'].avg,

@@ -40,6 +40,28 @@ H36M_JOINT_TO_LABEL = {
 #     16:  4,  # LHand
 # }
 
+# Canonical 17-joint bones, moved unchanged from depth_diagnostics.BONES.
+# Labels follow H36M_JOINT_TO_LABEL above; joint IDs are authoritative.
+# Used by both bone delta-Z supervision and depth diagnosis.
+H36M_BONES = [
+    (0, 1),    # Bottom torso -> Left hip
+    (1, 2),    # Left hip -> Left knee
+    (2, 3),    # Left knee -> Left foot
+    (0, 4),    # Bottom torso -> Right hip
+    (4, 5),    # Right hip -> Right knee
+    (5, 6),    # Right knee -> Right foot
+    (0, 7),    # Bottom torso -> Center torso
+    (7, 8),    # Center torso -> Upper torso
+    (8, 9),    # Upper torso -> Neck base
+    (9, 10),   # Neck base -> Center head
+    (8, 11),   # Upper torso -> Right shoulder
+    (11, 12),  # Right shoulder -> Right elbow
+    (12, 13),  # Right elbow -> Right hand
+    (8, 14),   # Upper torso -> Left shoulder
+    (14, 15),  # Left shoulder -> Left elbow
+    (15, 16),  # Left elbow -> Left hand
+]
+
 H36M_LOWER_BODY_JOINTS = list(range(1, 7))
 H36M_UPPER_BODY_JOINTS = list(range(7, 17))
 

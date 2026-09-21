@@ -5,6 +5,28 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 
+from data.const import H36M_BONES
+
+
+def relative_depth_loss(predicted, target, skeleton_edges=H36M_BONES):
+    """L1 bone delta-Z error, averaged over batch, time and skeleton edges.
+
+    Inputs: matching [B, T, J, 3] tensors in the SAME coordinates as pose loss.
+    For H36M training these are normalized image/2.5D coordinates, with the
+    target root-relative. No millimetre conversion, alignment or detach here.
+    Intermediate delta-Z tensors have shape [B, T, E]. No learned parameters.
+    """
+    if predicted.shape != target.shape or predicted.ndim != 4 or predicted.shape[-1] != 3:
+        raise ValueError('Expected matching [B, T, J, 3] prediction and target')
+    edges = torch.as_tensor(skeleton_edges, dtype=torch.long, device=predicted.device)
+    if edges.ndim != 2 or edges.shape[1] != 2 or edges.shape[0] == 0:
+        raise ValueError('Expected a nonempty [E, 2] skeleton edge list')
+    parent, child = edges.unbind(dim=1)
+    pred_z, gt_z = predicted[..., 2], target[..., 2]
+    delta_z_pred = pred_z.index_select(-1, parent) - pred_z.index_select(-1, child)
+    delta_z_gt = gt_z.index_select(-1, parent) - gt_z.index_select(-1, child)
+    return (delta_z_pred - delta_z_gt).abs().mean()
+
 
 def mpjpe(predicted, target):
     """
