@@ -38,7 +38,7 @@ python diagnose_depth.py \
 `--checkpoint` 在新入口中接收**完整文件路径**，不同于 train.py 的目录参数。
 checkpoint 使用 strict=True 加载，兼容 DataParallel 的 module. 前缀，不会忽略权重不匹配。
 
-数据目录不同可传 `--data-root /path/to/motion3d`，其下应同时包含元数据 pkl 和 `H36M-243/test/` 切片。
+数据目录不同可传 `--data-root /path/to/motion3d`。默认 `--input-source metadata` 只需要该目录中的元数据 pkl；选择 `--input-source slices` 时还需要 `H36M-243/test/` 切片。
 程序逐片校验标签与元数据索引，不匹配就停止，避免静默错位。检查切片配置、顺序和短序列重采样种子。
 默认 seed=0；沿用 MotionDataset3D 中已有的 NumPy seed 行为。
 
@@ -130,3 +130,20 @@ large 配置新增 `grad_clip_norm: 1.0`；其他 H36M 配置未写该项时也�
 
 本次仅修改 train.py、large YAML 和说明文档。按用户明确要求未执行云端测试；
 上方的 CPU/单元测试结果属于此前诊断初版，不代表此次训练修改已测试。
+
+## 切片标签不匹配修复
+
+诊断默认使用 `--input-source metadata`：直接从同一元数据中的 joint_2d/confidence 读取检测输入，
+并使用完全相同的 frame_clips 索引提取真值、动作、相机尺度和来源。仍使用原读取器的归一化与划片逻辑。
+划片的 NumPy seed 固定为 0，与旧 MotionDataset3D 的初始化行为一致，记录在 summary 中。
+
+原因：原短序列 resample 使用 NumPy 随机数，预处理没有固定 NumPy seed，
+且保存的切片仅有 data_input/data_label，没有 frame IDs。重建索引不保证重现历史切片。
+这是一种可能导致标签校验失败的机制，不表示已通过用户实际数据确认该具体切片的原因。
+也不应直接忽略标签不一致后继续计算指标。
+
+元数据模式不改写已有切片、不使用 GT 构造 2D 输入，也不需要重新训练。
+它保证本次诊断输入与标签一致，但短序列上下文/采样可能与历史切片不同，
+因此不能承诺与旧 train.py 评估数值逐位一致。比较实验应统一使用同一诊断模式与划片设置。
+需要核查旧切片时使用 `--input-source slices`，仍严格校验，并打印 source 和最大标签差异。
+此修复尚未用用户真实数据和 checkpoint 验证。
