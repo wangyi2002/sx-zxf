@@ -7,7 +7,7 @@ import subprocess
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from data.const import H36M_JOINT_TO_LABEL
@@ -17,6 +17,46 @@ from loss.pose3d import p_mpjpe
 from utils.data import flip_data
 from utils.depth_diagnostics import DepthDiagnostics
 from utils.tools import get_config, set_random_seed
+
+
+
+class MetadataTestClips(Dataset):
+    """Use one index map for detector inputs, labels and evaluation metadata.
+
+    Legacy preprocessed pickles contain no frame IDs; random resampling of short
+    sequences cannot be reliably reconstructed from a seed chosen afterwards.
+    """
+    def __init__(self, test, frame_clips):
+        self.test = test
+        self.frame_clips = frame_clips
+
+    def __len__(self):
+        return len(self.frame_clips)
+
+    def __getitem__(self, index):
+        ids = self.frame_clips[index]
+        inputs = np.asarray(self.test['joint_2d'])[ids, :, :2].astype(np.float32)
+        labels = np.asarray(self.test['joint3d_image'])[ids, :, :3].astype(np.float32)
+        cameras = np.asarray(self.test['camera_name'])[ids]
+        for t, camera in enumerate(cameras):
+            if camera in ('54138969', '60457274'):
+                width, height = 1000, 1002
+            elif camera in ('55011271', '58860488'):
+                width, height = 1000, 1000
+            else:
+                raise ValueError(f'Invalid H36M camera: {camera}')
+            # Same normalization as DataReaderH36M.read_2d/read_3d.
+            inputs[t] = inputs[t] / width * 2 - [1, height / width]
+            labels[t, :, :2] = labels[t, :, :2] / width * 2 - [1, height / width]
+            labels[t, :, 2:] = labels[t, :, 2:] / width * 2
+        if 'confidence' in self.test:
+            confidence = np.asarray(self.test['confidence'])[ids].astype(np.float32)
+            if confidence.ndim == 2:
+                confidence = confidence[..., None]
+        else:
+            confidence = np.ones(inputs.shape[:-1] + (1,), dtype=np.float32)
+        inputs = np.concatenate((inputs, confidence), axis=-1)
+        return torch.from_numpy(inputs), torch.from_numpy(labels)
 
 
 def parse_args():
@@ -29,6 +69,8 @@ def parse_args():
     parser.add_argument('--num-workers', type=int, default=0)
     parser.add_argument('--ordering-threshold-mm', type=float, default=10.)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--input-source', choices=['metadata', 'slices'], default='metadata',
+                        help='metadata: aligned detector input/GT from raw pkl; slices: strict legacy slice validation')
     opts = parser.parse_args()
     if opts.batch_size < 1 or opts.num_workers < 0:
         parser.error('batch-size must be positive; num-workers must be nonnegative')
@@ -52,16 +94,23 @@ def main():
     if opts.data_root:
         config.data_root = opts.data_root
     set_random_seed(opts.seed)
-    dataset = MotionDataset3D(config, config.subset_list, 'test')
+    # Match the legacy dataset's NumPy seed=0 before creating frame indices.
+    # Metadata mode never mixes saved random slices with regenerated indices.
+    np.random.seed(0)
     reader = DataReaderH36M(config.n_frames, sample_stride=1,
                            data_stride_train=config.n_frames // 3,
                            data_stride_test=config.n_frames,
                            dt_root=config.data_root, dt_file=config.dt_file)
     _, frame_clips = reader.get_split_id()
     frame_clips = np.asarray(frame_clips)
-    if len(dataset) != len(frame_clips):
-        raise ValueError(f'Sliced files ({len(dataset)}) and metadata clips ({len(frame_clips)}) differ')
     test = reader.dt_dataset['test']
+    if opts.input_source == 'metadata':
+        dataset = MetadataTestClips(test, frame_clips)
+        print('[INFO] Input source: metadata; detector inputs and GT share exact frame indices.')
+    else:
+        dataset = MotionDataset3D(config, config.subset_list, 'test')
+        if len(dataset) != len(frame_clips):
+            raise ValueError(f'Sliced files ({len(dataset)}) and metadata clips ({len(frame_clips)}) differ')
     diagnostics = DepthDiagnostics(frame_clips, test['action'], test['source'],
                                    H36M_JOINT_TO_LABEL, opts.ordering_threshold_mm)
     test_hw = reader.get_hw()
@@ -97,7 +146,10 @@ def main():
                 expected_label[..., 2:] = expected_label[..., 2:] / width * 2
                 if not np.allclose(labels[b].numpy(), expected_label, atol=1e-5, rtol=1e-5):
                     raise ValueError(f'Clip {idx} labels do not match metadata frame indices. '
-                                     'Check preprocessing, subset, file order and resampling seed.')
+                                     f'source={test["source"][ids[0]]}, '
+                                     f'max_abs_label_diff={np.max(np.abs(labels[b].numpy() - expected_label)):.6g}. '
+                                     'Use --input-source metadata to read aligned inputs and GT; '
+                                     'do not disable this check for mismatched saved slices.')
                 # Same operations and float32 storage as DataReaderH36M.denormalize.
                 pred = pred.copy()
                 pred[..., :2] = (pred[..., :2] + [1, height / width]) * width / 2
@@ -120,7 +172,8 @@ def main():
     summary = diagnostics.save(opts.output_dir, dict(config=dict(config),
         checkpoint=str(checkpoint_path), checkpoint_sha256=digest.hexdigest(),
         git_revision=revision, total_parameters=total_params, trainable_parameters=trainable_params,
-        added_parameters=0, seed=opts.seed, inference_batch_size=opts.batch_size,
+        added_parameters=0, seed=opts.seed, split_numpy_seed=0, input_source=opts.input_source,
+        inference_batch_size=opts.batch_size,
         joint_labels_source='user supplied data/const.py; interpret IDs as authoritative'))
     print(json.dumps(summary['action_macro'], indent=2))
     print(f'Reports: {opts.output_dir}')
