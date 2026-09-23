@@ -10,6 +10,7 @@ from model.modules.mlp import MLP
 from model.modules.tcn import MultiScaleTCN
 from model.modules.mamba import MAM
 from model.modules.hypergraph import HGN
+from model.modules.srda import SkeletonRelativeDepthAdapter
 # from model.modules.dyt import DyT
 # from mamba_ssm import Mamba2
 
@@ -313,7 +314,8 @@ class MotionAGFormer(nn.Module):
                  drop=0., drop_path=0., use_layer_scale=True, layer_scale_init_value=1e-5, use_adaptive_fusion=True,
                  num_heads=4, qkv_bias=False, qkv_scale=None, hierarchical=False, num_joints=17,
                  use_temporal_similarity=True, temporal_connection_len=1, use_tcn=False, graph_only=False,
-                 neighbour_num=4, n_frames=243):
+                 neighbour_num=4, n_frames=243, use_skeleton_relative_depth_adapter=False,
+                 depth_adapter_ratio=0.25):
         """
         :param n_layers: Number of layers.
         :param dim_in: Input dimension.
@@ -388,7 +390,16 @@ class MotionAGFormer(nn.Module):
 
         self.head = nn.Linear(dim_rep, dim_out)
 
-    def forward(self, x, return_rep=False):
+        self.depth_adapter = None
+        if use_skeleton_relative_depth_adapter:
+            if num_joints != 17 or dim_out != 3:
+                raise ValueError('SRDA requires H36M 17 joints and XYZ output')
+            # Added initialization must not change the RNG stream used by the
+            # existing training pipeline; baseline parameters are created first.
+            with torch.random.fork_rng(devices=[]):
+                self.depth_adapter = SkeletonRelativeDepthAdapter(dim_feat, depth_adapter_ratio)
+
+    def forward(self, x, return_rep=False, return_depth_stats=False):
         """
         :param x: tensor with shape [B, T, J, C] (T=243, J=17, C=3)
         :param return_rep: Returns motion representation feature volume (In case of using this as backbone)
@@ -403,11 +414,25 @@ class MotionAGFormer(nn.Module):
             x = layer(x)
 
         x = self.norm(x)
+        features = x  # Final shared backbone feature, before 128 -> 512 rep_logit.
         x = self.rep_logit(x)
         if return_rep:
             return x
 
         x = self.head(x)
+
+        if self.depth_adapter is not None:
+            bone_residual, joint_residual = self.depth_adapter(features)
+            # XY are copied unchanged from the original head. Root residual is 0.
+            x = torch.cat((x[..., :2], x[..., 2:3] + joint_residual.unsqueeze(-1)), dim=-1)
+            if return_depth_stats:
+                # Small detached sums/counts, gathered correctly by DataParallel
+                # even when replicas receive different batch sizes.
+                with torch.no_grad():
+                    stats = torch.stack((bone_residual.abs().sum(), joint_residual.abs().sum(),
+                                         bone_residual.new_tensor(bone_residual.numel()),
+                                         joint_residual.new_tensor(joint_residual.numel())))[None]
+                return x, stats
 
         return x
 
