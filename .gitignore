@@ -2,7 +2,7 @@
 *.tar.xz
 *.pyc
 wandb
-checkpoint/*.pth.tr
+/checkpoint/
 
 # 数据集
 /data/motion3d/
