@@ -58,7 +58,7 @@ def train_one_epoch(args, model, train_loader, optimizer, device, losses):
             else:
                 y[..., 2] = y[..., 2] - y[:, 0:1, 0:1, 2]  # Place the depth of first frame root to be 0
 
-        if getattr(args, 'use_skeleton_relative_depth_adapter', False):
+        if (getattr(args, 'use_skeleton_relative_depth_adapter', False) or getattr(args, 'use_joint_depth_adapter', False)):
             pred, depth_stats = model(x, return_depth_stats=True)
             stats = depth_stats.sum(dim=0)  # Sum over DataParallel replicas.
             losses['depth_adapter_bone_residual_abs_mean'].update((stats[0] / stats[2]).item(), batch_size)
@@ -249,7 +249,7 @@ def save_checkpoint(checkpoint_path, epoch, lr, optimizer, model, min_mpjpe, wan
 
 def train(args, opts):
     if getattr(args, 'use_relative_depth_loss', False):
-        raise ValueError('SRDA experiment uses original losses only; disable use_relative_depth_loss')
+        raise ValueError('Depth adapter experiments use original losses only; disable use_relative_depth_loss')
     # Default applies to older H36M configs too; 0 explicitly disables clipping.
     args.grad_clip_norm = float(getattr(args, 'grad_clip_norm', 1.0))
     if not np.isfinite(args.grad_clip_norm) or args.grad_clip_norm < 0:
@@ -339,13 +339,13 @@ def train(args, opts):
         print(f"[INFO] epoch {epoch}")
         loss_names = ['3d_pose', '3d_scale', '2d_proj', 'lg', 'lv', '3d_velocity', 'angle', 'angle_velocity', 'total', 'grad_norm', 'grad_clip_fraction']
         losses = {name: AverageMeter() for name in loss_names}
-        if getattr(args, 'use_skeleton_relative_depth_adapter', False):
+        if (getattr(args, 'use_skeleton_relative_depth_adapter', False) or getattr(args, 'use_joint_depth_adapter', False)):
             losses.update({name: AverageMeter() for name in (
                 'depth_adapter_bone_residual_abs_mean', 'depth_adapter_joint_residual_abs_mean')})
 
         train_one_epoch(args, model, train_loader, optimizer, device, losses)
-        if getattr(args, 'use_skeleton_relative_depth_adapter', False):
-            print(f"[INFO] SRDA |bone residual|: {losses['depth_adapter_bone_residual_abs_mean'].avg:.6f}; "
+        if (getattr(args, 'use_skeleton_relative_depth_adapter', False) or getattr(args, 'use_joint_depth_adapter', False)):
+            print(f"[INFO] Depth adapter |bone residual|: {losses['depth_adapter_bone_residual_abs_mean'].avg:.6f}; "
                   f"|joint residual|: {losses['depth_adapter_joint_residual_abs_mean'].avg:.6f}")
         if args.grad_clip_norm > 0:
             print(f"[INFO] Gradient L2 norm before clipping (step mean): {losses['grad_norm'].avg:.4f}; "
@@ -377,7 +377,7 @@ def train(args, opts):
                 **({
                     'train/depth_adapter_bone_residual_abs_mean': losses['depth_adapter_bone_residual_abs_mean'].avg,
                     'train/depth_adapter_joint_residual_abs_mean': losses['depth_adapter_joint_residual_abs_mean'].avg,
-                } if getattr(args, 'use_skeleton_relative_depth_adapter', False) else {}),
+                } if (getattr(args, 'use_skeleton_relative_depth_adapter', False) or getattr(args, 'use_joint_depth_adapter', False)) else {}),
                 **({
                     'train/grad_norm_before_clip': losses['grad_norm'].avg,
                     'train/grad_clip_fraction': losses['grad_clip_fraction'].avg,

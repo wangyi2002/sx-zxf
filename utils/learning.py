@@ -57,7 +57,8 @@ def load_model(args):
                                neighbour_num=args.neighbour_num,
                                n_frames=args.n_frames,
                                use_skeleton_relative_depth_adapter=getattr(args, 'use_skeleton_relative_depth_adapter', False),
-                               depth_adapter_ratio=getattr(args, 'depth_adapter_ratio', 0.25))
+                               depth_adapter_ratio=getattr(args, 'depth_adapter_ratio', 0.25),
+                               use_joint_depth_adapter=getattr(args, 'use_joint_depth_adapter', False))
     else:
         raise Exception("Undefined model name")
 

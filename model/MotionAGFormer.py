@@ -11,6 +11,7 @@ from model.modules.tcn import MultiScaleTCN
 from model.modules.mamba import MAM
 from model.modules.hypergraph import HGN
 from model.modules.srda import SkeletonRelativeDepthAdapter
+from model.modules.joint_depth_adapter import JointDepthAdapter
 # from model.modules.dyt import DyT
 # from mamba_ssm import Mamba2
 
@@ -315,7 +316,7 @@ class MotionAGFormer(nn.Module):
                  num_heads=4, qkv_bias=False, qkv_scale=None, hierarchical=False, num_joints=17,
                  use_temporal_similarity=True, temporal_connection_len=1, use_tcn=False, graph_only=False,
                  neighbour_num=4, n_frames=243, use_skeleton_relative_depth_adapter=False,
-                 depth_adapter_ratio=0.25):
+                 depth_adapter_ratio=0.25, use_joint_depth_adapter=False):
         """
         :param n_layers: Number of layers.
         :param dim_in: Input dimension.
@@ -391,13 +392,16 @@ class MotionAGFormer(nn.Module):
         self.head = nn.Linear(dim_rep, dim_out)
 
         self.depth_adapter = None
-        if use_skeleton_relative_depth_adapter:
+        if use_skeleton_relative_depth_adapter and use_joint_depth_adapter:
+            raise ValueError('Select only one depth adapter: SRDA or joint')
+        if use_skeleton_relative_depth_adapter or use_joint_depth_adapter:
             if num_joints != 17 or dim_out != 3:
-                raise ValueError('SRDA requires H36M 17 joints and XYZ output')
+                raise ValueError('Depth adapters require H36M 17 joints and XYZ output')
             # Added initialization must not change the RNG stream used by the
             # existing training pipeline; baseline parameters are created first.
             with torch.random.fork_rng(devices=[]):
-                self.depth_adapter = SkeletonRelativeDepthAdapter(dim_feat, depth_adapter_ratio)
+                adapter_cls = JointDepthAdapter if use_joint_depth_adapter else SkeletonRelativeDepthAdapter
+                self.depth_adapter = adapter_cls(dim_feat, depth_adapter_ratio)
 
     def forward(self, x, return_rep=False, return_depth_stats=False, depth_adapter_alpha=1.0):
         """
