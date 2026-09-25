@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import subprocess
 
@@ -94,11 +95,15 @@ def parse_args():
     parser.add_argument('--num-workers', type=int, default=0)
     parser.add_argument('--ordering-threshold-mm', type=float, default=10.)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--depth-adapter-alpha', type=float, default=1.0,
+                        help='Inference-only SRDA residual scale: 0=raw trained head, 0.5=half, 1=full')
     parser.add_argument('--input-source', choices=['metadata', 'slices'], default='metadata',
                         help='metadata: aligned detector input/GT from raw pkl; slices: strict legacy slice validation')
     opts = parser.parse_args()
     if opts.batch_size < 1 or opts.num_workers < 0:
         parser.error('batch-size must be positive; num-workers must be nonnegative')
+    if not math.isfinite(opts.depth_adapter_alpha) or not 0 <= opts.depth_adapter_alpha <= 1:
+        parser.error('depth-adapter-alpha must be finite and in [0, 1]')
     return opts
 
 
@@ -147,6 +152,9 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     adapter = getattr(model, 'depth_adapter', None)
+    if adapter is None and opts.depth_adapter_alpha != 1.0:
+        raise ValueError('Non-default depth-adapter-alpha requires an SRDA model/config')
+    print(f'[INFO] SRDA inference residual alpha: {opts.depth_adapter_alpha}')
     added_params = sum(p.numel() for p in adapter.parameters()) if adapter is not None else 0
     print(f'Parameters: total={total_params:,}, trainable={trainable_params:,}; added={added_params:,}')
     del state, checkpoint
@@ -157,9 +165,9 @@ def main():
     with torch.inference_mode():
         for inputs, labels in tqdm(loader, desc='Depth diagnosis'):
             inputs = inputs.cuda(non_blocking=True)
-            predicted = model(inputs)
+            predicted = model(inputs, depth_adapter_alpha=opts.depth_adapter_alpha)
             if config.flip:
-                predicted = (predicted + flip_data(model(flip_data(inputs)))) / 2
+                predicted = (predicted + flip_data(model(flip_data(inputs), depth_adapter_alpha=opts.depth_adapter_alpha))) / 2
             predicted[:, :, 0, :] = 0
             predicted = predicted.cpu().numpy()
             for b, pred in enumerate(predicted):
@@ -195,6 +203,7 @@ def main():
         checkpoint=str(checkpoint_path), checkpoint_sha256=digest.hexdigest(),
         git_revision=revision, total_parameters=total_params, trainable_parameters=trainable_params,
         added_parameters=added_params, seed=opts.seed, split_numpy_seed=0, input_source=opts.input_source,
+        depth_adapter_alpha=opts.depth_adapter_alpha,
         inference_batch_size=opts.batch_size, camera_normalization='per-frame',
         joint_labels_source='user supplied data/const.py; interpret IDs as authoritative'))
     print(json.dumps(summary['action_macro'], indent=2))

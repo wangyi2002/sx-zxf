@@ -399,11 +399,13 @@ class MotionAGFormer(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 self.depth_adapter = SkeletonRelativeDepthAdapter(dim_feat, depth_adapter_ratio)
 
-    def forward(self, x, return_rep=False, return_depth_stats=False):
+    def forward(self, x, return_rep=False, return_depth_stats=False, depth_adapter_alpha=1.0):
         """
         :param x: tensor with shape [B, T, J, C] (T=243, J=17, C=3)
         :param return_rep: Returns motion representation feature volume (In case of using this as backbone)
         """
+        if self.training and depth_adapter_alpha != 1.0:
+            raise ValueError('depth_adapter_alpha is an inference-only ablation control')
         x = self.joints_embed(x)
         x = x + self.gcn_s(x)
         x = x + self.gcn_t(x)
@@ -423,8 +425,14 @@ class MotionAGFormer(nn.Module):
 
         if self.depth_adapter is not None:
             bone_residual, joint_residual = self.depth_adapter(features)
-            # XY are copied unchanged from the original head. Root residual is 0.
-            x = torch.cat((x[..., :2], x[..., 2:3] + joint_residual.unsqueeze(-1)), dim=-1)
+            # Inference ablation only; keep checkpoint keys and training unchanged.
+            # alpha=0 returns this trained model's raw head, not a baseline checkpoint.
+            # Statistics below describe the unscaled adapter residuals.
+            if depth_adapter_alpha != 0.0:
+                correction = joint_residual.unsqueeze(-1)
+                if depth_adapter_alpha != 1.0:
+                    correction = correction * depth_adapter_alpha
+                x = torch.cat((x[..., :2], x[..., 2:3] + correction), dim=-1)
             if return_depth_stats:
                 # Small detached sums/counts, gathered correctly by DataParallel
                 # even when replicas receive different batch sizes.
