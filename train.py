@@ -1,5 +1,8 @@
 import argparse
 import os
+import json
+import random
+from utils.frozen_srda import initialize_frozen_srda, set_frozen_training_mode, frozen_digest, check_zero_output
 
 import numpy as np
 import pkg_resources
@@ -29,6 +32,7 @@ from utils.data import Augmenter2D
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--baseline-checkpoint", type=str, help="Clean baseline FILE for frozen SRDA")
     parser.add_argument("--config", type=str, default="configs/h36m/MotionAGFormer-base.yaml", help="Path to the config file.")
     parser.add_argument('-c', '--checkpoint', type=str, metavar='PATH',
                         help='checkpoint directory')
@@ -47,7 +51,10 @@ def parse_args():
 
 
 def train_one_epoch(args, model, train_loader, optimizer, device, losses):
-    model.train()
+    if getattr(args, 'freeze_baseline', False):
+        set_frozen_training_mode(model)
+    else:
+        model.train()
     for x, y in tqdm(train_loader):
         batch_size = x.shape[0]
         x, y = x.to(device), y.to(device)
@@ -254,6 +261,14 @@ def train(args, opts):
     args.grad_clip_norm = float(getattr(args, 'grad_clip_norm', 1.0))
     if not np.isfinite(args.grad_clip_norm) or args.grad_clip_norm < 0:
         raise ValueError("grad_clip_norm must be finite and >= 0")
+    frozen = getattr(args, 'freeze_baseline', False)
+    if frozen:
+        if not getattr(args, 'use_skeleton_relative_depth_adapter', False):
+            raise ValueError('freeze_baseline requires SRDA')
+        if not opts.baseline_checkpoint or opts.checkpoint or opts.resume or opts.eval_only:
+            raise ValueError('Use --baseline-checkpoint FILE only; frozen mode does not support resume/checkpoint/eval-only')
+    elif opts.baseline_checkpoint:
+        raise ValueError('--baseline-checkpoint requires freeze_baseline=true')
     print_args(args)
     create_directory_if_not_exists(opts.new_checkpoint)
 
@@ -276,12 +291,19 @@ def train(args, opts):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = load_model(args)
+    if frozen:
+        source, source_sha = initialize_frozen_srda(model, opts.baseline_checkpoint, opts.new_checkpoint)
+        args.baseline_checkpoint_source = source
+        args.baseline_checkpoint_sha256 = source_sha
     if torch.cuda.is_available():
         model = torch.nn.DataParallel(model)
     model.to(device)
 
     n_params = count_param_numbers(model)
     print(f"[INFO] Number of parameters: {n_params:,}")
+    if frozen:
+        print(f"[INFO] Trainable adapter parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+        frozen_state = frozen_digest(model)
 
     lr = args.learning_rate
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
@@ -331,6 +353,34 @@ def train(args, opts):
     checkpoint_path_latest = os.path.join(opts.new_checkpoint, 'latest_epoch.pth.tr')
     checkpoint_path_best = os.path.join(opts.new_checkpoint, 'best_epoch.pth.tr')
 
+    if frozen:
+        # Additional baseline evaluation must not consume training RNG state.
+        py_rng, np_rng = random.getstate(), np.random.get_state()
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        try:
+            inputs, _ = next(iter(test_loader))
+            check_zero_output(model, inputs.to(device))
+            initial_mpjpe, initial_p2, _, initial_acc = evaluate(args, model, test_loader, datareader, device)
+        finally:
+            random.setstate(py_rng)
+            np.random.set_state(np_rng)
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+        if frozen_digest(model) != frozen_state:
+            raise RuntimeError('Frozen baseline changed during initial evaluation')
+        reference = dict(baseline_checkpoint=source, baseline_sha256=source_sha,
+                         mpjpe=float(initial_mpjpe), p_mpjpe=float(initial_p2),
+                         acceleration_error=float(initial_acc), zero_init_equal=True)
+        with open(os.path.join(opts.new_checkpoint, 'frozen_baseline_reference.json'), 'w') as stream:
+            json.dump(reference, stream, indent=2)
+        if opts.use_wandb:
+            wandb.log({'frozen_baseline/mpjpe': initial_mpjpe,
+                       'frozen_baseline/p-mpjpe': initial_p2}, step=0)
+        # Best means best TRAINED epoch, even when worse than baseline.
+        print(f'[INFO] Baseline reference MPJPE: {initial_mpjpe:.6f}')
+
     for epoch in range(epoch_start, args.epochs):
         if opts.eval_only:
             evaluate(args, model, test_loader, datareader, device)
@@ -353,6 +403,9 @@ def train(args, opts):
                   f"max norm: {args.grad_clip_norm}")
 
         mpjpe, p_mpjpe, joints_error, acceleration_error = evaluate(args, model, test_loader, datareader, device)
+
+        if frozen and frozen_digest(model) != frozen_state:
+            raise RuntimeError('Frozen baseline parameters or buffers changed')
 
         if mpjpe < min_mpjpe:
             min_mpjpe = mpjpe
