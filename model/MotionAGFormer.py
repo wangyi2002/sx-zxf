@@ -1,4 +1,5 @@
 from collections import OrderedDict
+from copy import deepcopy
 
 import torch
 from torch import nn
@@ -313,7 +314,7 @@ class MotionAGFormer(nn.Module):
                  drop=0., drop_path=0., use_layer_scale=True, layer_scale_init_value=1e-5, use_adaptive_fusion=True,
                  num_heads=4, qkv_bias=False, qkv_scale=None, hierarchical=False, num_joints=17,
                  use_temporal_similarity=True, temporal_connection_len=1, use_tcn=False, graph_only=False,
-                 neighbour_num=4, n_frames=243):
+                 neighbour_num=4, n_frames=243, use_xy_z_split=False, xy_z_split_blocks=2):
         """
         :param n_layers: Number of layers.
         :param dim_in: Input dimension.
@@ -388,6 +389,30 @@ class MotionAGFormer(nn.Module):
 
         self.head = nn.Linear(dim_rep, dim_out)
 
+        # Instantiate the entire baseline first, preserving its RNG stream and
+        # initialization. Copies below have independent storage and consume no RNG.
+        self.baseline_parameter_count = sum(p.numel() for p in self.parameters())
+        self.use_xy_z_split = use_xy_z_split
+        if use_xy_z_split:
+            if dim_out != 3:
+                raise ValueError('XY/Z split requires dim_out=3')
+            if isinstance(xy_z_split_blocks, bool) or not isinstance(xy_z_split_blocks, int):
+                raise ValueError('xy_z_split_blocks must be an integer')
+            if not 1 <= xy_z_split_blocks < n_layers:
+                raise ValueError('Require 1 <= xy_z_split_blocks < n_layers')
+            self.xy_z_split_at = n_layers - xy_z_split_blocks
+            self.z_layers = deepcopy(self.layers[self.xy_z_split_at:])
+            self.z_norm = deepcopy(self.norm)
+            self.z_rep_logit = deepcopy(self.rep_logit)
+            self.z_head = deepcopy(self.head)
+            # Partition all three initialized output rows; no unused parameters.
+            self.z_head.weight = nn.Parameter(self.head.weight[2:3].detach().clone())
+            self.z_head.bias = nn.Parameter(self.head.bias[2:3].detach().clone())
+            self.z_head.out_features = 1
+            self.head.weight = nn.Parameter(self.head.weight[:2].detach().clone())
+            self.head.bias = nn.Parameter(self.head.bias[:2].detach().clone())
+            self.head.out_features = 2
+
     def forward(self, x, return_rep=False):
         """
         :param x: tensor with shape [B, T, J, C] (T=243, J=17, C=3)
@@ -398,6 +423,20 @@ class MotionAGFormer(nn.Module):
         x = x + self.gcn_t(x)
         x = x + self.pos_embed
 
+        if self.use_xy_z_split:
+            for layer in self.layers[:self.xy_z_split_at]:
+                x = layer(x)
+            z = x  # No detach: both tasks train the shared prefix.
+            for layer in self.layers[self.xy_z_split_at:]:
+                x = layer(x)
+            for layer in self.z_layers:
+                z = layer(z)
+            x = self.rep_logit(self.norm(x))
+            z = self.z_rep_logit(self.z_norm(z))
+            if return_rep:
+                # Split models have two representations, each [B,T,J,dim_rep].
+                return x, z
+            return torch.cat((self.head(x), self.z_head(z)), dim=-1)
 
         for layer in self.layers:
             x = layer(x)

@@ -268,6 +268,12 @@ def train(args, opts):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = load_model(args)
+    if getattr(args, 'use_xy_z_split', False):
+        total_params = count_param_numbers(model)
+        print(f'[INFO] XY/Z split: shared blocks={model.xy_z_split_at}, '
+              f'independent blocks per path={len(model.z_layers)}, '
+              f'baseline params={model.baseline_parameter_count:,}, '
+              f'added params={total_params - model.baseline_parameter_count:,}')
     if torch.cuda.is_available():
         model = torch.nn.DataParallel(model)
     model.to(device)

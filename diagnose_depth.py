@@ -146,7 +146,8 @@ def main():
     model.load_state_dict(state, strict=True)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'Parameters: total={total_params:,}, trainable={trainable_params:,}; added=0')
+    added_params = total_params - model.baseline_parameter_count
+    print(f'Parameters: total={total_params:,}, trainable={trainable_params:,}; added={added_params:,}')
     del state, checkpoint
     model = model.cuda().eval()
     loader = DataLoader(dataset, batch_size=opts.batch_size, shuffle=False,
@@ -192,7 +193,8 @@ def main():
     summary = diagnostics.save(opts.output_dir, dict(config=dict(config),
         checkpoint=str(checkpoint_path), checkpoint_sha256=digest.hexdigest(),
         git_revision=revision, total_parameters=total_params, trainable_parameters=trainable_params,
-        added_parameters=0, seed=opts.seed, split_numpy_seed=0, input_source=opts.input_source,
+        added_parameters=total_params - model.baseline_parameter_count,
+        seed=opts.seed, split_numpy_seed=0, input_source=opts.input_source,
         inference_batch_size=opts.batch_size, camera_normalization='per-frame',
         joint_labels_source='user supplied data/const.py; interpret IDs as authoritative'))
     print(json.dumps(summary['action_macro'], indent=2))

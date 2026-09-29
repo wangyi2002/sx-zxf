@@ -55,7 +55,9 @@ def load_model(args):
                                use_tcn=args.use_tcn,
                                graph_only=args.graph_only,
                                neighbour_num=args.neighbour_num,
-                               n_frames=args.n_frames)
+                               n_frames=args.n_frames,
+                               use_xy_z_split=getattr(args, 'use_xy_z_split', False),
+                               xy_z_split_blocks=getattr(args, 'xy_z_split_blocks', 2))
     else:
         raise Exception("Undefined model name")
 
