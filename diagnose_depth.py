@@ -60,8 +60,20 @@ class MetadataTestClips(Dataset):
     Legacy preprocessed pickles contain no frame IDs; random resampling of short
     sequences cannot be reliably reconstructed from a seed chosen afterwards.
     """
-    def __init__(self, test, frame_clips):
+    def __init__(self, test, frame_clips, input_xy='detector'):
         self.test = test
+        self.input_xy = input_xy
+        if input_xy not in ('detector', 'gt-image'):
+            raise ValueError('Unknown input XY source')
+        if input_xy == 'gt-image':
+            detector = np.asarray(test['joint_2d'])
+            gt = np.asarray(test['joint3d_image'])
+            if detector.ndim != 3 or gt.ndim != 3 or detector.shape[:2] != gt.shape[:2] or gt.shape[1:] != (17, 3):
+                raise ValueError('Expected aligned [N,17,3] GT image labels and detector joints')
+            if len(test['camera_name']) != len(gt):
+                raise ValueError('GT/camera frame counts differ')
+            if 'confidence' not in test:
+                raise ValueError('GT control requires original detector confidence; do not silently replace with ones')
         self.frame_clips = frame_clips
 
     def __len__(self):
@@ -72,6 +84,10 @@ class MetadataTestClips(Dataset):
         inputs = np.asarray(self.test['joint_2d'])[ids, :, :2].astype(np.float32)
         labels = np.asarray(self.test['joint3d_image'])[ids, :, :3].astype(np.float32)
         cameras = np.asarray(self.test['camera_name'])[ids]
+        if self.input_xy == 'gt-image':
+            # Existing project's image-space label convention, BEFORE root centering.
+            # Never use camera-space joints_2.5d_image XY as 2D image coordinates.
+            inputs = labels[..., :2].copy()
         inputs = normalize_pose_frames(inputs, cameras)
         labels = normalize_pose_frames(labels, cameras)
         if 'confidence' in self.test:
@@ -80,6 +96,11 @@ class MetadataTestClips(Dataset):
                 confidence = confidence[..., None]
         else:
             confidence = np.ones(inputs.shape[:-1] + (1,), dtype=np.float32)
+        if self.input_xy == 'gt-image':
+            if confidence.shape != inputs.shape[:-1] + (1,):
+                raise ValueError('Detector confidence shape does not match GT XY')
+            if not np.isfinite(inputs).all() or not np.isfinite(confidence).all():
+                raise ValueError('Nonfinite GT XY or detector confidence')
         inputs = np.concatenate((inputs, confidence), axis=-1)
         return torch.from_numpy(inputs), torch.from_numpy(labels)
 
@@ -96,7 +117,12 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--input-source', choices=['metadata', 'slices'], default='metadata',
                         help='metadata: aligned detector input/GT from raw pkl; slices: strict legacy slice validation')
+    parser.add_argument('--input-xy', choices=['detector', 'gt-image'], default='detector',
+                        help='GT image-label XY control; retains detector confidence, no retraining')
+    parser.add_argument('--reference-summary', help='Optional detector depth_summary.json; enforce same weight SHA256 and settings')
     opts = parser.parse_args()
+    if opts.input_xy != 'detector' and opts.input_source != 'metadata':
+        parser.error('GT XY control requires --input-source metadata')
     if opts.batch_size < 1 or opts.num_workers < 0:
         parser.error('batch-size must be positive; num-workers must be nonnegative')
     return opts
@@ -109,9 +135,35 @@ def main():
         raise ValueError('First version supports H36M 17 joints, root_rel=True, add_velocity=False')
     if config.use_proj_as_2d:
         raise ValueError('Use detector 2D input for baseline diagnosis, not projected GT input')
+    if opts.input_xy == 'gt-image' and any(getattr(config, key, False) for key in (
+            'use_skeleton_relative_depth_adapter', 'use_joint_depth_adapter', 'use_relative_depth_loss', 'freeze_baseline')):
+        raise ValueError('Use the clean baseline config for GT input control')
     checkpoint_path = Path(opts.checkpoint)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
+    digest = hashlib.sha256()
+    with checkpoint_path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    if opts.reference_summary:
+        reference = json.loads(Path(opts.reference_summary).read_text())
+        metadata = reference['metadata']
+        if metadata['checkpoint_sha256'] != digest.hexdigest():
+            raise ValueError('Reference used different checkpoint weights')
+        if metadata.get('input_xy', 'detector') != 'detector' or metadata.get('input_source') != 'metadata':
+            raise ValueError('Reference must use detector XY and metadata input')
+        if metadata.get('camera_normalization') != 'per-frame' or metadata.get('seed') != opts.seed:
+            raise ValueError('Reference camera normalization/seed differs')
+        if metadata.get('inference_batch_size') != opts.batch_size or reference['ordering_threshold_mm'] != opts.ordering_threshold_mm:
+            raise ValueError('Reference batch size/ordering threshold differs')
+        reference_config = {k: v for k, v in metadata['config'].items() if k != 'name'}
+        current_config = {k: v for k, v in dict(config).items() if k != 'name'}
+        if opts.data_root:
+            current_config['data_root'] = opts.data_root
+        if reference_config != current_config:
+            raise ValueError('Reference config differs from baseline config')
+        if Path(opts.output_dir).resolve() == Path(opts.reference_summary).resolve().parent:
+            raise ValueError('Use a separate output directory to preserve detector reference')
     if not torch.cuda.is_available():
         raise RuntimeError('Checkpoint diagnosis uses the original CUDA Mamba kernel. '
                            'For CPU shape/parameter validation run tools/smoke_depth.py.')
@@ -130,8 +182,10 @@ def main():
     frame_clips = np.asarray(frame_clips)
     test = reader.dt_dataset['test']
     if opts.input_source == 'metadata':
-        dataset = MetadataTestClips(test, frame_clips)
-        print('[INFO] Input source: metadata; detector inputs and GT share exact frame indices.')
+        dataset = MetadataTestClips(test, frame_clips, opts.input_xy)
+        print(f'[INFO] Input source: metadata; XY={opts.input_xy}; confidence=original detector; aligned frame indices.')
+        if opts.input_xy == 'gt-image':
+            print('[INFO] Diagnostic oracle input only: GT image-label XY, not a deployable model score.')
     else:
         dataset = MotionDataset3D(config, config.subset_list, 'test')
         if len(dataset) != len(frame_clips):
@@ -143,6 +197,8 @@ def main():
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     state = checkpoint['model'] if 'model' in checkpoint else checkpoint
     state = {(k[7:] if k.startswith('module.') else k): v for k, v in state.items()}
+    if any('depth_adapter.' in key for key in state):
+        raise ValueError('Adapter checkpoint detected. Supply the original clean baseline weights.')
     model.load_state_dict(state, strict=True)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -185,14 +241,13 @@ def main():
         revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
     except (OSError, subprocess.CalledProcessError):
         revision = None
-    digest = hashlib.sha256()
-    with checkpoint_path.open('rb') as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b''):
-            digest.update(chunk)
     summary = diagnostics.save(opts.output_dir, dict(config=dict(config),
         checkpoint=str(checkpoint_path), checkpoint_sha256=digest.hexdigest(),
         git_revision=revision, total_parameters=total_params, trainable_parameters=trainable_params,
         added_parameters=0, seed=opts.seed, split_numpy_seed=0, input_source=opts.input_source,
+        input_xy=opts.input_xy, confidence_source='detector confidence (unchanged)',
+        gt_xy_field='joint3d_image[..., :2] before root centering' if opts.input_xy == 'gt-image' else None,
+        oracle_input=opts.input_xy == 'gt-image', reference_summary=opts.reference_summary,
         inference_batch_size=opts.batch_size, camera_normalization='per-frame',
         joint_labels_source='user supplied data/const.py; interpret IDs as authoritative'))
     print(json.dumps(summary['action_macro'], indent=2))
