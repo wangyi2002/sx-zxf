@@ -57,7 +57,8 @@ def load_model(args):
                                neighbour_num=args.neighbour_num,
                                n_frames=args.n_frames,
                                use_xy_z_split=getattr(args, 'use_xy_z_split', False),
-                               xy_z_split_blocks=getattr(args, 'xy_z_split_blocks', 2))
+                               xy_z_split_blocks=getattr(args, 'xy_z_split_blocks', 2),
+                               use_xy_depth_interaction=getattr(args, 'use_xy_depth_interaction', False))
     else:
         raise Exception("Undefined model name")
 

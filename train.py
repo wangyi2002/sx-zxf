@@ -274,6 +274,8 @@ def train(args, opts):
               f'independent blocks per path={len(model.z_layers)}, '
               f'baseline params={model.baseline_parameter_count:,}, '
               f'added params={total_params - model.baseline_parameter_count:,}')
+    if getattr(args, 'use_xy_depth_interaction', False):
+        print('[INFO] E6: spatial XY->Z cross-attention between suffix blocks; no detach')
     if torch.cuda.is_available():
         model = torch.nn.DataParallel(model)
     model.to(device)

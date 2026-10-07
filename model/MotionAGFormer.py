@@ -5,6 +5,7 @@ import torch
 from torch import nn
 from timm.models.layers import DropPath
 
+from model.modules.xy_depth_interaction import XYDepthInteraction
 from model.modules.attention import Attention
 from model.modules.graph import GCN
 from model.modules.mlp import MLP
@@ -314,7 +315,7 @@ class MotionAGFormer(nn.Module):
                  drop=0., drop_path=0., use_layer_scale=True, layer_scale_init_value=1e-5, use_adaptive_fusion=True,
                  num_heads=4, qkv_bias=False, qkv_scale=None, hierarchical=False, num_joints=17,
                  use_temporal_similarity=True, temporal_connection_len=1, use_tcn=False, graph_only=False,
-                 neighbour_num=4, n_frames=243, use_xy_z_split=False, xy_z_split_blocks=2):
+                 neighbour_num=4, n_frames=243, use_xy_z_split=False, xy_z_split_blocks=2, use_xy_depth_interaction=False):
         """
         :param n_layers: Number of layers.
         :param dim_in: Input dimension.
@@ -392,6 +393,9 @@ class MotionAGFormer(nn.Module):
         # Instantiate the entire baseline first, preserving its RNG stream and
         # initialization. Copies below have independent storage and consume no RNG.
         self.baseline_parameter_count = sum(p.numel() for p in self.parameters())
+        self.use_xy_depth_interaction = use_xy_depth_interaction
+        if use_xy_depth_interaction and (not use_xy_z_split or xy_z_split_blocks != 2):
+            raise ValueError("XY-guided depth requires XY/Z split with exactly two blocks")
         self.use_xy_z_split = use_xy_z_split
         if use_xy_z_split:
             if dim_out != 3:
@@ -413,6 +417,9 @@ class MotionAGFormer(nn.Module):
             self.head.bias = nn.Parameter(self.head.bias[:2].detach().clone())
             self.head.out_features = 2
 
+        if use_xy_depth_interaction:
+            self.xy_depth_interaction = XYDepthInteraction(dim_feat, num_heads)
+
     def forward(self, x, return_rep=False):
         """
         :param x: tensor with shape [B, T, J, C] (T=243, J=17, C=3)
@@ -427,10 +434,17 @@ class MotionAGFormer(nn.Module):
             for layer in self.layers[:self.xy_z_split_at]:
                 x = layer(x)
             z = x  # No detach: both tasks train the shared prefix.
-            for layer in self.layers[self.xy_z_split_at:]:
-                x = layer(x)
-            for layer in self.z_layers:
-                z = layer(z)
+            if self.use_xy_depth_interaction:
+                x = self.layers[self.xy_z_split_at](x)
+                z = self.z_layers[0](z)
+                z = self.xy_depth_interaction(z, x)
+                x = self.layers[self.xy_z_split_at + 1](x)
+                z = self.z_layers[1](z)
+            else:
+                for layer in self.layers[self.xy_z_split_at:]:
+                    x = layer(x)
+                for layer in self.z_layers:
+                    z = layer(z)
             x = self.rep_logit(self.norm(x))
             z = self.z_rep_logit(self.z_norm(z))
             if return_rep:
